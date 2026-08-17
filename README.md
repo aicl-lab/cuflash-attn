@@ -1,6 +1,6 @@
 # CuFlash-Attn
 
-> **从零实现的高性能 CUDA C++ FlashAttention**
+> **从零实现的 CUDA C++ FlashAttention 教学/参考实现；FP16/BF16 前向已接入 WMMA。**
 
 [![CI](https://img.shields.io/github/actions/workflow/status/AICL-Lab/cuflash-attn/ci.yml?branch=master&style=flat-square&logo=github&label=CI)](https://github.com/AICL-Lab/cuflash-attn/actions/workflows/ci.yml)
 [![CodeQL](https://img.shields.io/github/actions/workflow/status/AICL-Lab/cuflash-attn/codeql.yml?branch=master&style=flat-square&logo=github&label=CodeQL)](https://github.com/AICL-Lab/cuflash-attn/actions/workflows/codeql.yml)
@@ -65,12 +65,25 @@ CuFlash-Attn 是一个**从零实现的 FlashAttention 算法**，用于教育�
 
 ---
 
+## 🧭 项目边界（IN / OUT）
+
+**IN（本仓库负责）**：
+- FlashAttention 前向 + 反向
+- FP16 / BF16 / FP32 多精度，causal mask
+- FlashDecoding（decode 阶段 KV 分块并行）
+- 优化叙事与 benchmark（Roofline、kernel 深挖）
+
+**OUT（明确不做，见对应仓库）**：
+- GEMM 基础与 CUDA 编程学习 → [cuda-kernel-academy](https://github.com/AICL-Lab/cuda-kernel-academy)
+- Triton 版算子（参考实现）→ [triton-fused-ops](https://github.com/AICL-Lab/triton-fused-ops)
+- 完整推理运行时（模型加载/采样/生成）→ [tiny-llm](https://github.com/AICL-Lab/tiny-llm)
+
 ## 🚀 快速开始
 
 ### 环境要求
 
 - **GPU**: NVIDIA GPU，计算能力 7.0+（V100、RTX 20/30/40、A100、H100）
-- **CUDA Toolkit**: 11.8 或更高版本（推荐 12.x；sm_90/Hopper 需要 11.8+）
+- **CUDA Toolkit**: 11.8 或更高版本（推荐 12.x；sm_90/Hopper 需要 11.8+；注意 CUDA 13.x 已移除 sm_70 支持）
 - **CMake**: 3.18 或更高版本（使用 CMake preset 需 3.20+）
 - **编译器**: GCC 7+、Clang 5+ 或 MSVC 2017+（需要 C++17 支持）
 
@@ -213,6 +226,11 @@ print(f"输出形状: {O.shape}, 平均值: {O.mean().item():.4f}")
 
 FlashAttention 通过分块与在线 softmax 避免物化完整注意力矩阵。实际延迟、吞吐和显存收益取决于 GPU、CUDA、dtype、形状和 causal 模式；仓库不维护无法持续复测的固定性能数字，请在目标硬件上运行自带 benchmark。
 
+**指标口径**：FlashAttention kernel 用 **CUDA Event 计时**（排除 host 开销）；
+带宽指标为**模型化 logical HBM**（前向：Q/O 各一次 + K/V 按 Q block 重载，见
+[algorithm](../docs/algorithm.md)），并非 ncu 实测的物理带宽。请勿把 `LogicalHBM GB/s`
+当作硬件实测 HBM 带宽。
+
 ### 运行基准测试
 
 ```bash
@@ -244,7 +262,7 @@ cmake --build --preset release
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | `head_dim` | 32, 64, 128 | 内核优化必需 |
-| **数据类型** | FP32 (`float`), FP16 (`half`) | 前向和反向都支持 |
+| **数据类型** | FP32 (`float`), FP16 (`half`), BF16 (`__nv_bfloat16`) | 前向和反向都支持 |
 | **因果掩码** | 可选 | 运行时启用/禁用 |
 | **批大小** | ≥ 1 | 任意正整数 |
 | **序列长度** | ≥ 1 | 优化用于 1K-16K+ |
@@ -260,7 +278,8 @@ cmake --build --preset release
 | Ada Lovelace | sm_89 | RTX 4090 |
 | Hopper | sm_90 | H100 |
 
-**默认构建目标**: sm_80, sm_86（A100 + RTX 30xx/40xx）
+**默认构建目标**: sm_80, sm_86（A100 + RTX 30xx）。可配置编译 sm_70–sm_90；
+仓库当前实测硬件为 **sm_86（RTX 3060）**。
 
 自定义使用: `cmake --preset release -DCMAKE_CUDA_ARCHITECTURES="90"`
 
@@ -388,6 +407,6 @@ ctest --preset release --output-on-failure
 ---
 
 <p align="center">
-  <sub>用 ❤️ 打造的高效注意力计算</sub><br>
+  <sub>用 ❤️ 打造的教学/参考注意力实现</sub><br>
   <sub>精简参考实现 · CUDA C++ · 开源</sub>
 </p>
