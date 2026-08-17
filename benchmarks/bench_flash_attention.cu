@@ -1,12 +1,15 @@
 #include <benchmark/benchmark.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <vector>
 
 #include "cuflash/flash_attention.h"
+#include "impl/tile_io.cuh"
+#include "kernel_launch_utils.cuh"
 
 // Helper: allocate device memory and fill with random data
 template<typename T>
@@ -29,28 +32,120 @@ static std::vector<T*> allocate_and_init(const std::vector<size_t>& sizes) {
     return ptrs;
 }
 
-// Report achieved compute and memory throughput so results can be read against
-// the hardware roofline, not just wall-clock.
-//   FLOP model: forward = 4 * B*H*N^2*D (the two N x N matmuls QK^T and PV);
-//               backward ~= 2.5x forward (dQ, dK, dV, dS, dP).
-//   Byte model: FlashAttention streams Q, K, V, O once each = 4 * B*H*N*D elems.
-static void report_metrics(benchmark::State& state, int batch_size, int num_heads, int seq_len,
-                           int head_dim, size_t elem_size, bool backward) {
+// =============================================================================
+// FLOPs and logical-HBM models
+// =============================================================================
+// FLOPs model (scalar and tensor-core forward, scalar backward):
+//   forward: 2*N^2*D (QK^T) + 2*N^2*D (PV) = 4*B*H*N^2*D
+//   causal forward ~= half.
+//   backward (this implementation's actual scalar path):
+//     dQ kernel  3 tile matmuls (QK^T, dO·V^T, dS·K)
+//     dKdV kernel 4 tile matmuls (QK^T, P^T·dO, dO·V^T, dS^T·Q)
+//     = 14 * B*H*N^2*D FLOPs; causal ~= half.
+static double attention_flops(int batch_size, int num_heads, int seq_len,
+                              int head_dim, bool backward, bool causal) {
+    const double bh = static_cast<double>(batch_size) * num_heads;
     const double n = static_cast<double>(seq_len);
-    const double elems = static_cast<double>(batch_size) * num_heads * n * head_dim;
-    double flops = 4.0 * elems * n;
-    if (backward) {
-        flops *= 2.5;
+    const double d = static_cast<double>(head_dim);
+    double flops = (backward ? 14.0 : 4.0) * bh * n * n * d;
+    if (causal) {
+        flops *= 0.5;
     }
-    const double bytes = 4.0 * elems * static_cast<double>(elem_size);
-    state.counters["TFLOP/s"] =
-        benchmark::Counter(flops, benchmark::Counter::kIsIterationInvariantRate,
-                           benchmark::Counter::OneK::kIs1000) /
-        1e12;
-    state.counters["HBM GB/s"] =
-        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate,
-                           benchmark::Counter::OneK::kIs1000) /
-        1e9;
+    return flops;
+}
+
+// Logical HBM elements for the forward pass (no padding counted):
+//   Q read once + O written once; K and V are re-read once per Q block.
+//   causal: a Q block only touches the KV rows up to its last row.
+static double fwd_logical_hbm_elements(int bh, int n, int d, bool causal, int bm) {
+    const int q_blocks = (n + bm - 1) / bm;
+    double kv_rows = 0.0;
+    for (int qb = 0; qb < q_blocks; ++qb) {
+        const int q_start = qb * bm;
+        const int valid_rows = causal ? std::min(q_start + bm, n) : n;
+        kv_rows += static_cast<double>(valid_rows);
+    }
+    // Q + O 各 1 次，K/V 各按每个 Q block 的重载次数计
+    return 2.0 * static_cast<double>(bh) * n * d +
+           2.0 * static_cast<double>(bh) * d * kv_rows;
+}
+
+// Forward tiling choices, mirroring the launcher in
+// flash_attention_forward_typed.cu / flash_attention_forward_wmma.cu.
+struct FwdTile {
+    int bm = 0;
+    int bn = 0;
+};
+
+static FwdTile fwd_scalar_tile(int head_dim, int max_dynamic_smem) {
+    using C = cuflash::impl::ForwardTilingConfig;
+    if (head_dim == 32) return {C::BLOCK_M, C::BLOCK_N};
+    if (head_dim == 64) {
+        if (C::smem_bytes(64, C::BLOCK_M, C::BLOCK_N) >
+            static_cast<size_t>(max_dynamic_smem)) {
+            return {C::BLOCK_M_SMALL, C::BLOCK_N_SMALL};
+        }
+        return {C::BLOCK_M, C::BLOCK_N};
+    }
+    // head_dim == 128
+    if (C::smem_bytes(128, C::BLOCK_M_HD128, C::BLOCK_N_HD128) >
+        static_cast<size_t>(max_dynamic_smem)) {
+        return {C::BLOCK_M_HD128_SMALL, C::BLOCK_N_HD128_SMALL};
+    }
+    return {C::BLOCK_M_HD128, C::BLOCK_N_HD128};
+}
+
+static FwdTile fwd_wmma_tile(int head_dim) {
+    return (head_dim == 128) ? FwdTile{32, 32} : FwdTile{64, 32};
+}
+
+// Pick the tile the forward launcher will actually use for a given element
+// size: FP32 always takes the scalar path; reduced precision takes the WMMA
+// path on sm_70+ (FP16) / sm_80+ (BF16) and the scalar path otherwise.
+static FwdTile fwd_tile_for_elem_size(size_t elem_size, int head_dim, int max_dynamic_smem) {
+    if (elem_size == sizeof(float)) {
+        return fwd_scalar_tile(head_dim, max_dynamic_smem);
+    }
+    int device = 0;
+    int major = 0;
+    bool use_wmma = false;
+    if (cudaGetDevice(&device) == cudaSuccess &&
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) ==
+            cudaSuccess) {
+        // On sm_8x+ both FP16 and BF16 take the WMMA path; on sm_70 FP16 does.
+        use_wmma = major >= 8 || major == 7;
+    }
+    return use_wmma ? fwd_wmma_tile(head_dim) : fwd_scalar_tile(head_dim, max_dynamic_smem);
+}
+
+// Report achieved compute and (forward-only) logical HBM throughput so results
+// can be read against the hardware roofline.
+//   Logical HBM is reported for the forward pass only; backward HBM would need
+//   an ncu measurement because the current code has no reliable byte model.
+//   Counter names use "LogicalHBM GB/s" on purpose so nobody mistakes the
+//   modeled number for a measured HBM bandwidth.
+static void report_metrics(benchmark::State& state, int batch_size, int num_heads,
+                           int seq_len, int head_dim, size_t elem_size,
+                           bool backward, bool causal) {
+    const double flops =
+        attention_flops(batch_size, num_heads, seq_len, head_dim, backward, causal);
+    state.counters["GFLOPS/s"] = benchmark::Counter(
+        flops / 1e9,
+        benchmark::Counter::kIsIterationInvariantRate,
+        benchmark::Counter::OneK::kIs1000);
+
+    if (!backward) {
+        int max_dynamic_smem = 0;
+        cuflash::query_max_dynamic_shared_memory_per_block(&max_dynamic_smem);
+        const FwdTile tile = fwd_tile_for_elem_size(elem_size, head_dim, max_dynamic_smem);
+        const double logical_bytes =
+            fwd_logical_hbm_elements(batch_size * num_heads, seq_len, head_dim, causal, tile.bm) *
+            static_cast<double>(elem_size);
+        state.counters["LogicalHBM GB/s"] = benchmark::Counter(
+            logical_bytes / 1e9,
+            benchmark::Counter::kIsIterationInvariantRate,
+            benchmark::Counter::OneK::kIs1000);
+    }
 }
 
 // =============================================================================
@@ -59,7 +154,8 @@ static void report_metrics(benchmark::State& state, int batch_size, int num_head
 // Forms the full N x N score matrix. This is the "standard" attention that
 // FlashAttention exists to avoid; it is included ONLY as a comparison point
 // (and intentionally runs out of memory at large N), not as a recommended
-// implementation.
+// implementation. Timed with wall-clock + cudaStreamSynchronize: this is NOT
+// a production baseline and is intentionally not event-timed.
 __global__ void naive_attention_kernel(const float* __restrict__ Q, const float* __restrict__ K,
                                        const float* __restrict__ V, float* __restrict__ O,
                                        int seq_len, int head_dim, float scale, bool causal) {
@@ -154,20 +250,24 @@ static void BM_NaiveForward_FP32(benchmark::State& state) {
         cudaStreamSynchronize(stream);
     }
 
-    // The naive path also materializes the N x N score matrix (written + read).
-    const double n = static_cast<double>(seq_len);
-    const double elems = static_cast<double>(batch_size) * num_heads * n * head_dim;
-    const double flops = 4.0 * elems * n;
+    // The naive path also materializes the N x N score matrix (written + read),
+    // so its HBM model is intentionally different from the FlashAttention path:
+    //   Q/K/V/O each once + S/P written and read once = 4*elems + 2*B*H*N^2 elems.
+    const double flops =
+        attention_flops(batch_size, num_heads, seq_len, head_dim, /*backward=*/false,
+                        /*causal=*/false);
+    const double elems = static_cast<double>(batch_size) * num_heads * seq_len * head_dim;
     const double bytes = 4.0 * elems * sizeof(float) +
-                         2.0 * static_cast<double>(batch_size) * num_heads * n * n * sizeof(float);
-    state.counters["TFLOP/s"] =
-        benchmark::Counter(flops, benchmark::Counter::kIsIterationInvariantRate,
-                           benchmark::Counter::OneK::kIs1000) /
-        1e12;
-    state.counters["HBM GB/s"] =
-        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate,
-                           benchmark::Counter::OneK::kIs1000) /
-        1e9;
+                         2.0 * static_cast<double>(batch_size) * num_heads * seq_len * seq_len *
+                             sizeof(float);
+    state.counters["GFLOPS/s"] = benchmark::Counter(
+        flops / 1e9,
+        benchmark::Counter::kIsIterationInvariantRate,
+        benchmark::Counter::OneK::kIs1000);
+    state.counters["HBM GB/s"] = benchmark::Counter(
+        bytes / 1e9,
+        benchmark::Counter::kIsIterationInvariantRate,
+        benchmark::Counter::OneK::kIs1000);
 
     cudaStreamDestroy(stream);
     for (auto* ptr : devs) {
@@ -184,8 +284,11 @@ BENCHMARK(BM_NaiveForward_FP32)
     ->Unit(benchmark::kMillisecond);
 
 // =============================================================================
-// FlashAttention forward / backward
+// FlashAttention forward / backward (CUDA Event timed)
 // =============================================================================
+// All FlashAttention benchmarks below use CUDA events on the launch stream so
+// that the reported iteration time excludes host-side overhead. Do NOT
+// cudaMalloc/cudaFree or re-initialize data inside the timing loop.
 
 // FP32 Forward Benchmark
 static void BM_Forward_FP32(benchmark::State& state) {
@@ -208,18 +311,32 @@ static void BM_Forward_FP32(benchmark::State& state) {
     cudaStream_t stream = nullptr;
     cudaStreamCreate(&stream);
 
+    cudaEvent_t ev_start = nullptr, ev_stop = nullptr;
+    cudaEventCreate(&ev_start);
+    cudaEventCreate(&ev_stop);
+
     for (auto _ : state) {
+        cudaEventRecord(ev_start, stream);
         auto err = cuflash::flash_attention_forward(d_Q, d_K, d_V, d_O, d_L, batch_size, num_heads,
                                                     seq_len, head_dim, scale, false, stream);
+        cudaEventRecord(ev_stop, stream);
+
         if (err != cuflash::FlashAttentionError::SUCCESS) {
             state.SkipWithError("flash_attention_forward failed");
             break;
         }
-        cudaStreamSynchronize(stream);
+
+        cudaEventSynchronize(ev_stop);
+        float elapsed_ms = 0.0f;
+        cudaEventElapsedTime(&elapsed_ms, ev_start, ev_stop);
+        state.SetIterationTime(elapsed_ms / 1000.0);
     }
 
-    report_metrics(state, batch_size, num_heads, seq_len, head_dim, sizeof(float), false);
+    report_metrics(state, batch_size, num_heads, seq_len, head_dim, sizeof(float),
+                   /*backward=*/false, /*causal=*/false);
 
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
     cudaStreamDestroy(stream);
     for (auto* ptr : devs) {
         cudaFree(ptr);
@@ -232,7 +349,8 @@ BENCHMARK(BM_Forward_FP32)
     ->Args({2048, 64})
     ->Args({4096, 64})
     ->Args({4096, 128})
-    ->Unit(benchmark::kMillisecond);
+    ->Unit(benchmark::kMillisecond)
+    ->UseManualTime();
 
 // FP32 Backward Benchmark
 static void BM_Backward_FP32(benchmark::State& state) {
@@ -256,19 +374,33 @@ static void BM_Backward_FP32(benchmark::State& state) {
     cudaStream_t stream = nullptr;
     cudaStreamCreate(&stream);
 
+    cudaEvent_t ev_start = nullptr, ev_stop = nullptr;
+    cudaEventCreate(&ev_start);
+    cudaEventCreate(&ev_stop);
+
     for (auto _ : state) {
+        cudaEventRecord(ev_start, stream);
         auto err = cuflash::flash_attention_backward(d_Q, d_K, d_V, d_O, d_L, d_dO, d_dQ, d_dK,
                                                      d_dV, batch_size, num_heads, seq_len, head_dim,
                                                      scale, false, stream);
+        cudaEventRecord(ev_stop, stream);
+
         if (err != cuflash::FlashAttentionError::SUCCESS) {
             state.SkipWithError("flash_attention_backward failed");
             break;
         }
-        cudaStreamSynchronize(stream);
+
+        cudaEventSynchronize(ev_stop);
+        float elapsed_ms = 0.0f;
+        cudaEventElapsedTime(&elapsed_ms, ev_start, ev_stop);
+        state.SetIterationTime(elapsed_ms / 1000.0);
     }
 
-    report_metrics(state, batch_size, num_heads, seq_len, head_dim, sizeof(float), true);
+    report_metrics(state, batch_size, num_heads, seq_len, head_dim, sizeof(float),
+                   /*backward=*/true, /*causal=*/false);
 
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
     cudaStreamDestroy(stream);
     for (auto* ptr : devs) {
         cudaFree(ptr);
@@ -281,7 +413,8 @@ BENCHMARK(BM_Backward_FP32)
     ->Args({2048, 64})
     ->Args({4096, 64})
     ->Args({4096, 128})
-    ->Unit(benchmark::kMillisecond);
+    ->Unit(benchmark::kMillisecond)
+    ->UseManualTime();
 
 // Reduced-precision (FP16/BF16) forward. L (logsumexp) is always FP32 even for
 // reduced-precision inputs, so it is allocated separately; see
@@ -308,18 +441,32 @@ static void BM_Forward_ReducedPrec(benchmark::State& state) {
     cudaStream_t stream = nullptr;
     cudaStreamCreate(&stream);
 
+    cudaEvent_t ev_start = nullptr, ev_stop = nullptr;
+    cudaEventCreate(&ev_start);
+    cudaEventCreate(&ev_stop);
+
     for (auto _ : state) {
+        cudaEventRecord(ev_start, stream);
         auto err = cuflash::flash_attention_forward(d_Q, d_K, d_V, d_O, d_L, batch_size, num_heads,
                                                     seq_len, head_dim, scale, false, stream);
+        cudaEventRecord(ev_stop, stream);
+
         if (err != cuflash::FlashAttentionError::SUCCESS) {
             state.SkipWithError("flash_attention_forward (reduced precision) failed");
             break;
         }
-        cudaStreamSynchronize(stream);
+
+        cudaEventSynchronize(ev_stop);
+        float elapsed_ms = 0.0f;
+        cudaEventElapsedTime(&elapsed_ms, ev_start, ev_stop);
+        state.SetIterationTime(elapsed_ms / 1000.0);
     }
 
-    report_metrics(state, batch_size, num_heads, seq_len, head_dim, sizeof(InputT), false);
+    report_metrics(state, batch_size, num_heads, seq_len, head_dim, sizeof(InputT),
+                   /*backward=*/false, /*causal=*/false);
 
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
     cudaStreamDestroy(stream);
     for (auto* ptr : devs) {
         cudaFree(ptr);
@@ -339,7 +486,8 @@ BENCHMARK(BM_Forward_FP16)
     ->Args({2048, 64})
     ->Args({4096, 64})
     ->Args({4096, 128})
-    ->Unit(benchmark::kMillisecond);
+    ->Unit(benchmark::kMillisecond)
+    ->UseManualTime();
 
 static void BM_Forward_BF16(benchmark::State& state) {
     BM_Forward_ReducedPrec<__nv_bfloat16>(state);
@@ -351,7 +499,8 @@ BENCHMARK(BM_Forward_BF16)
     ->Args({2048, 64})
     ->Args({4096, 64})
     ->Args({4096, 128})
-    ->Unit(benchmark::kMillisecond);
+    ->Unit(benchmark::kMillisecond)
+    ->UseManualTime();
 
 // Reduced-precision (FP16/BF16) backward with FP32 L, same rationale as above.
 template<typename InputT>
@@ -378,19 +527,33 @@ static void BM_Backward_ReducedPrec(benchmark::State& state) {
     cudaStream_t stream = nullptr;
     cudaStreamCreate(&stream);
 
+    cudaEvent_t ev_start = nullptr, ev_stop = nullptr;
+    cudaEventCreate(&ev_start);
+    cudaEventCreate(&ev_stop);
+
     for (auto _ : state) {
+        cudaEventRecord(ev_start, stream);
         auto err = cuflash::flash_attention_backward(d_Q, d_K, d_V, d_O, d_L, d_dO, d_dQ, d_dK,
                                                      d_dV, batch_size, num_heads, seq_len, head_dim,
                                                      scale, false, stream);
+        cudaEventRecord(ev_stop, stream);
+
         if (err != cuflash::FlashAttentionError::SUCCESS) {
             state.SkipWithError("flash_attention_backward (reduced precision) failed");
             break;
         }
-        cudaStreamSynchronize(stream);
+
+        cudaEventSynchronize(ev_stop);
+        float elapsed_ms = 0.0f;
+        cudaEventElapsedTime(&elapsed_ms, ev_start, ev_stop);
+        state.SetIterationTime(elapsed_ms / 1000.0);
     }
 
-    report_metrics(state, batch_size, num_heads, seq_len, head_dim, sizeof(InputT), true);
+    report_metrics(state, batch_size, num_heads, seq_len, head_dim, sizeof(InputT),
+                   /*backward=*/true, /*causal=*/false);
 
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
     cudaStreamDestroy(stream);
     for (auto* ptr : devs) {
         cudaFree(ptr);
@@ -410,7 +573,8 @@ BENCHMARK(BM_Backward_FP16)
     ->Args({2048, 64})
     ->Args({4096, 64})
     ->Args({4096, 128})
-    ->Unit(benchmark::kMillisecond);
+    ->Unit(benchmark::kMillisecond)
+    ->UseManualTime();
 
 static void BM_Backward_BF16(benchmark::State& state) {
     BM_Backward_ReducedPrec<__nv_bfloat16>(state);
@@ -422,7 +586,9 @@ BENCHMARK(BM_Backward_BF16)
     ->Args({2048, 64})
     ->Args({4096, 64})
     ->Args({4096, 128})
-    ->Unit(benchmark::kMillisecond);
+    ->Unit(benchmark::kMillisecond)
+    ->UseManualTime();
+
 // Causal Mask Forward Benchmark
 static void BM_Forward_Causal(benchmark::State& state) {
     int seq_len = state.range(0);
@@ -444,30 +610,32 @@ static void BM_Forward_Causal(benchmark::State& state) {
     cudaStream_t stream = nullptr;
     cudaStreamCreate(&stream);
 
+    cudaEvent_t ev_start = nullptr, ev_stop = nullptr;
+    cudaEventCreate(&ev_start);
+    cudaEventCreate(&ev_stop);
+
     for (auto _ : state) {
+        cudaEventRecord(ev_start, stream);
         auto err = cuflash::flash_attention_forward(d_Q, d_K, d_V, d_O, d_L, batch_size, num_heads,
                                                     seq_len, head_dim, scale, true, stream);
+        cudaEventRecord(ev_stop, stream);
+
         if (err != cuflash::FlashAttentionError::SUCCESS) {
             state.SkipWithError("flash_attention_forward (causal) failed");
             break;
         }
-        cudaStreamSynchronize(stream);
+
+        cudaEventSynchronize(ev_stop);
+        float elapsed_ms = 0.0f;
+        cudaEventElapsedTime(&elapsed_ms, ev_start, ev_stop);
+        state.SetIterationTime(elapsed_ms / 1000.0);
     }
 
-    // Causal masking does roughly half the work on average.
-    const double n = static_cast<double>(seq_len);
-    const double elems = static_cast<double>(batch_size) * num_heads * n * head_dim;
-    const double flops = 0.5 * 4.0 * elems * n;
-    const double bytes = 4.0 * elems * sizeof(float);
-    state.counters["TFLOP/s"] =
-        benchmark::Counter(flops, benchmark::Counter::kIsIterationInvariantRate,
-                           benchmark::Counter::OneK::kIs1000) /
-        1e12;
-    state.counters["HBM GB/s"] =
-        benchmark::Counter(bytes, benchmark::Counter::kIsIterationInvariantRate,
-                           benchmark::Counter::OneK::kIs1000) /
-        1e9;
+    report_metrics(state, batch_size, num_heads, seq_len, head_dim, sizeof(float),
+                   /*backward=*/false, /*causal=*/true);
 
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
     cudaStreamDestroy(stream);
     for (auto* ptr : devs) {
         cudaFree(ptr);
@@ -480,6 +648,7 @@ BENCHMARK(BM_Forward_Causal)
     ->Args({2048, 64})
     ->Args({4096, 64})
     ->Args({4096, 128})
-    ->Unit(benchmark::kMillisecond);
+    ->Unit(benchmark::kMillisecond)
+    ->UseManualTime();
 
 BENCHMARK_MAIN();

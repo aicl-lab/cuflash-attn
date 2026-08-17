@@ -222,6 +222,12 @@ if(BUILD_BENCHMARKS)
     add_executable(cuflash_attn_bench benchmarks/bench_flash_attention.cu)
     target_link_libraries(cuflash_attn_bench PRIVATE cuflash_attn benchmark::benchmark)
     set_target_properties(cuflash_attn_bench PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    # Private include dirs so the benchmark can reuse the internal tiling
+    # config (ForwardTilingConfig) to model logical HBM traffic accurately.
+    target_include_directories(cuflash_attn_bench PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/kernels
+        ${CMAKE_SOURCE_DIR}/src
+    )
     target_compile_options(cuflash_attn_bench PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:
             --expt-relaxed-constexpr
