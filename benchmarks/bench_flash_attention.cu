@@ -714,4 +714,63 @@ BENCHMARK(BM_Decode_FP16)
     ->Unit(benchmark::kMillisecond)
     ->UseManualTime();
 
+// Regression smoke: the forward launcher must flatten grid.y = batch_heads to
+// the x dimension. CUDA caps gridDim.y at 65535; B*H = 512*128 = 65536 > 65535
+// would make the old launch illegal (P1 correctness, historical audit T4).
+// seq_len=1 makes the attention output exactly V (single-element softmax), so
+// this also double-checks correctness cheaply. WMMA/FP16 is not exercised here
+// because seq_len=1 does not satisfy its tile constraints.
+static void BM_Forward_GridYOverflowSmoke(benchmark::State& state) {
+    const int batch_size = 512;
+    const int num_heads = 128;  // B*H = 65536 > 65535
+    const int seq_len = 1;
+    const int head_dim = 64;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    const size_t qkv_size = static_cast<size_t>(batch_size) * num_heads * seq_len * head_dim;
+    const size_t l_size = static_cast<size_t>(batch_size) * num_heads * seq_len;
+
+    auto devs = allocate_and_init<float>({qkv_size, qkv_size, qkv_size,  // Q, K, V
+                                          qkv_size,                      // O
+                                          l_size});                      // L
+    float *d_Q = devs[0], *d_K = devs[1], *d_V = devs[2];
+    float *d_O = devs[3], *d_L = devs[4];
+
+    std::vector<float> h_V(qkv_size), h_O(qkv_size);
+    cudaMemcpy(h_V.data(), d_V, qkv_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaStream_t stream = nullptr;
+    cudaStreamCreate(&stream);
+
+    for (auto _ : state) {
+        auto err = cuflash::flash_attention_forward(d_Q, d_K, d_V, d_O, d_L, batch_size, num_heads,
+                                                    seq_len, head_dim, scale, /*causal=*/false,
+                                                    stream);
+        if (err != cuflash::FlashAttentionError::SUCCESS) {
+            state.SkipWithError("flash_attention_forward (grid.y overflow smoke) failed");
+            break;
+        }
+    }
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(h_O.data(), d_O, qkv_size * sizeof(float), cudaMemcpyDeviceToHost);
+    float max_diff = 0.0f;
+    for (size_t i = 0; i < qkv_size; i++) {
+        max_diff = std::max(max_diff, std::fabs(h_O[i] - h_V[i]));
+    }
+    if (max_diff > 1e-3f) {
+        state.SkipWithError("grid.y overflow smoke: output mismatch (max diff too large)");
+    }
+
+    state.SetLabel("grid.y overflow smoke: bh=" + std::to_string(batch_size * num_heads));
+
+    cudaStreamDestroy(stream);
+    for (auto* ptr : devs) cudaFree(ptr);
+}
+// Smoke test, not a perf benchmark: fixed iteration count so Google Benchmark
+// does not extrapolate a runaway iteration count for the sub-ms kernel.
+BENCHMARK(BM_Forward_GridYOverflowSmoke)
+    ->Unit(benchmark::kMillisecond)
+    ->Iterations(10);
+
 BENCHMARK_MAIN();

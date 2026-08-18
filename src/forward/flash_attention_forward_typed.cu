@@ -18,8 +18,11 @@ __global__ void __launch_bounds__(128)
     flash_attention_forward_kernel(const InputT* __restrict__ Q, const InputT* __restrict__ K,
                                    const InputT* __restrict__ V, InputT* __restrict__ O,
                                    float* __restrict__ L, int seq_len, float scale, bool causal) {
-    const int batch_head_idx = blockIdx.y;
-    const int q_block_idx = blockIdx.x;
+    // grid 已展平到 x 维（total = num_q_blocks * batch_heads），避免
+    // grid.y = B*H 在 B*H > 65535 时超出 CUDA 的 gridDim.y 上限。
+    const int num_q_blocks = (seq_len + BLOCK_M - 1) / BLOCK_M;
+    const int q_block_idx = blockIdx.x % num_q_blocks;
+    const int batch_head_idx = blockIdx.x / num_q_blocks;
 
     const InputT* Q_ptr = Q + batch_head_idx * seq_len * HEAD_DIM;
     const InputT* K_ptr = K + batch_head_idx * seq_len * HEAD_DIM;
@@ -267,7 +270,9 @@ FlashAttentionError launch_flash_attention_forward_typed(const InputT* Q, const 
     }
 
     const int batch_heads = batch_size * num_heads;
-    const dim3 grid((seq_len + BM - 1) / BM, batch_heads);
+    // grid 展平到 x 维：gridDim.y 上限 65535，而 B*H 可能超过它。
+    const int num_q_blocks = (seq_len + BM - 1) / BM;
+    const dim3 grid(num_q_blocks * batch_heads);
     const dim3 block(Config::NUM_THREADS);
     const size_t smem_size = Config::smem_bytes(head_dim, BM, BN);
 

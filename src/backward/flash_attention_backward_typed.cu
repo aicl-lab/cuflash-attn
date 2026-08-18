@@ -14,8 +14,11 @@ template<typename InputT, int BLOCK_SIZE, int HEAD_DIM>
 __global__ void __launch_bounds__(128)
     compute_D_kernel(const InputT* __restrict__ dO, const InputT* __restrict__ O,
                      float* __restrict__ D, int seq_len) {
-    const int batch_head_idx = blockIdx.y;
-    const int row_idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+    // grid 已展平到 x 维（total = d_blocks * batch_heads），避免
+    // grid.y = B*H 在 B*H > 65535 时超出 CUDA 的 gridDim.y 上限。
+    const int d_blocks = (seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int batch_head_idx = blockIdx.x / d_blocks;
+    const int row_idx = (blockIdx.x % d_blocks) * BLOCK_SIZE + threadIdx.x;
 
     if (row_idx >= seq_len)
         return;
@@ -41,8 +44,10 @@ __global__ void __launch_bounds__(128)
                                        const InputT* __restrict__ dO, const float* __restrict__ D,
                                        InputT* __restrict__ dQ, int seq_len, float scale,
                                        bool causal) {
-    const int batch_head_idx = blockIdx.y;
-    const int q_block_idx = blockIdx.x;
+    // grid 已展平到 x 维（total = num_q_blocks * batch_heads）。
+    const int num_q_blocks = (seq_len + BLOCK_M - 1) / BLOCK_M;
+    const int q_block_idx = blockIdx.x % num_q_blocks;
+    const int batch_head_idx = blockIdx.x / num_q_blocks;
 
     const InputT* Q_ptr = Q + batch_head_idx * seq_len * HEAD_DIM;
     const InputT* K_ptr = K + batch_head_idx * seq_len * HEAD_DIM;
@@ -150,8 +155,10 @@ __global__ void __launch_bounds__(128)
                                          const InputT* __restrict__ dO, const float* __restrict__ D,
                                          InputT* __restrict__ dK, InputT* __restrict__ dV,
                                          int seq_len, float scale, bool causal) {
-    const int batch_head_idx = blockIdx.y;
-    const int kv_block_idx = blockIdx.x;
+    // grid 已展平到 x 维（total = num_kv_blocks * batch_heads）。
+    const int num_kv_blocks = (seq_len + BLOCK_N - 1) / BLOCK_N;
+    const int kv_block_idx = blockIdx.x % num_kv_blocks;
+    const int batch_head_idx = blockIdx.x / num_kv_blocks;
 
     const InputT* Q_ptr = Q + batch_head_idx * seq_len * HEAD_DIM;
     const InputT* K_ptr = K + batch_head_idx * seq_len * HEAD_DIM;
@@ -460,7 +467,8 @@ FlashAttentionError launch_flash_attention_backward_typed(
 
     // Phase 1: compute D = rowsum(dO * O)
     int d_blocks = (seq_len + 127) / 128;
-    dim3 d_grid(d_blocks, batch_heads);
+    // grid 展平到 x 维：gridDim.y 上限 65535，而 B*H 可能超过它。
+    dim3 d_grid(d_blocks * batch_heads);
 
     if (head_dim == 32) {
         compute_D_kernel<InputT, 128, 32><<<d_grid, 128, 0, stream>>>(dO, O, D, seq_len);
@@ -510,8 +518,8 @@ FlashAttentionError launch_flash_attention_backward_typed(
     }
 
     const dim3 block(Config::NUM_THREADS);
-    const dim3 dq_grid((seq_len + BM - 1) / BM, batch_heads);
-    const dim3 dkdv_grid((seq_len + BN - 1) / BN, batch_heads);
+    const dim3 dq_grid(((seq_len + BM - 1) / BM) * batch_heads);
+    const dim3 dkdv_grid(((seq_len + BN - 1) / BN) * batch_heads);
     const size_t dq_smem = Config::dq_smem_bytes(head_dim, BM, BN);
     const size_t dkdv_smem = Config::dkdv_smem_bytes(head_dim, BM, BN);
 

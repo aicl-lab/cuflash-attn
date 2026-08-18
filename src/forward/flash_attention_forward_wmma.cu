@@ -37,8 +37,11 @@ __global__ void __launch_bounds__(WMMA_THREADS)
     constexpr bool arch_ok =
         std::is_same_v<InputT, __nv_bfloat16> ? (__CUDA_ARCH__ >= 800) : (__CUDA_ARCH__ >= 700);
     if constexpr (arch_ok) {
-        const int batch_head_idx = blockIdx.y;
-        const int q_block_idx = blockIdx.x;
+        // grid 已展平到 x 维（total = num_q_blocks * batch_heads），避免
+        // grid.y = B*H 在 B*H > 65535 时超出 CUDA 的 gridDim.y 上限。
+        const int num_q_blocks = (seq_len + BLOCK_M - 1) / BLOCK_M;
+        const int q_block_idx = blockIdx.x % num_q_blocks;
+        const int batch_head_idx = blockIdx.x / num_q_blocks;
 
         const InputT* Q_ptr = Q + batch_head_idx * seq_len * HEAD_DIM;
         const InputT* K_ptr = K + batch_head_idx * seq_len * HEAD_DIM;
@@ -245,7 +248,9 @@ FlashAttentionError launch_flash_attention_forward_wmma_typed(
     const dim3 block(WMMA_THREADS);
 
     auto launch = [&](auto kernel_func, int BM, int BN, size_t smem_size) -> FlashAttentionError {
-        const dim3 grid((seq_len + BM - 1) / BM, batch_heads);
+        // grid 展平到 x 维：gridDim.y 上限 65535，而 B*H 可能超过它。
+        const int num_q_blocks = (seq_len + BM - 1) / BM;
+        const dim3 grid(num_q_blocks * batch_heads);
         FlashAttentionError prep =
             prepare_dynamic_smem_launch(reinterpret_cast<const void*>(kernel_func), smem_size);
         if (prep != FlashAttentionError::SUCCESS) {

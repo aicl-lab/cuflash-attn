@@ -332,6 +332,66 @@ TEST(ForwardTest, LogSumExpCausalMatchesReference) {
     cudaFree(d_L);
 }
 
+// Regression: grid.y = batch_size * num_heads must be flattened to the x
+// dimension. CUDA caps gridDim.y at 65535; B*H = 512*128 = 65536 > 65535 would
+// make the old launch illegal (P1 correctness, historical audit T4). This test
+// runs the FP32 scalar path with seq_len=1 (so num_q_blocks=1 and the whole
+// grid fits in x) and checks the output against the CPU reference.
+// The WMMA/FP16 path is not exercised here because seq_len=1 does not satisfy
+// its tile constraints.
+TEST(ForwardTest, GridYOverflowSmoke) {
+    const int batch_size = 512;
+    const int num_heads = 128;  // B*H = 65536 > 65535
+    const int seq_len = 1;
+    const int head_dim = 64;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    size_t qkv_size = static_cast<size_t>(batch_size) * num_heads * seq_len * head_dim;
+    size_t l_size = static_cast<size_t>(batch_size) * num_heads * seq_len;
+
+    std::vector<float> h_Q(qkv_size), h_K(qkv_size), h_V(qkv_size);
+    std::mt19937 gen(7);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (size_t i = 0; i < qkv_size; i++) {
+        h_Q[i] = dist(gen);
+        h_K[i] = dist(gen);
+        h_V[i] = dist(gen);
+    }
+
+    std::vector<float> h_O(qkv_size), h_L(l_size);
+    std::vector<float> ref_O(qkv_size);
+
+    reference_attention_forward(h_Q, h_K, h_V, ref_O, batch_size, num_heads, seq_len, head_dim,
+                                scale, /*causal=*/false);
+
+    float *d_Q, *d_K, *d_V, *d_O, *d_L;
+    ASSERT_EQ(cudaMalloc(&d_Q, qkv_size * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_K, qkv_size * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_V, qkv_size * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_O, qkv_size * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_L, l_size * sizeof(float)), cudaSuccess);
+
+    cudaMemcpy(d_Q, h_Q.data(), qkv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_K, h_K.data(), qkv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_V, h_V.data(), qkv_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    auto err = flash_attention_forward(d_Q, d_K, d_V, d_O, d_L, batch_size, num_heads, seq_len,
+                                       head_dim, scale, /*causal=*/false, 0);
+    ASSERT_EQ(err, FlashAttentionError::SUCCESS);
+
+    cudaDeviceSynchronize();
+    cudaMemcpy(h_O.data(), d_O, qkv_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    float diff = max_abs_diff(h_O, ref_O);
+    EXPECT_LT(diff, 1e-3f) << "Max difference: " << diff;
+
+    cudaFree(d_Q);
+    cudaFree(d_K);
+    cudaFree(d_V);
+    cudaFree(d_O);
+    cudaFree(d_L);
+}
+
 #if CUFLASH_ENABLE_RAPIDCHECK
 // Property test: Forward pass numerical equivalence
 // Feature: cuflash-attn, Property 1: 前向传播数值等价性
