@@ -5,9 +5,9 @@
 
 ## 阶段 1：数据刷新（低成本，先做）
 
-- [ ] 在可用 GPU 上复测 benchmark 矩阵（当前文档为 v0.4.0 快照）
-- [ ] 更新 docs/performance/benchmarks.md 的快照版本与日期
-- [ ] 补齐 head_dim=128 的 benchmark 覆盖（当前矩阵以 head_dim=64 为主）
+- [x] 在可用 GPU 上复测 benchmark 矩阵（RTX 3060 Laptop，commit `6860cbc`，2026-08-18）
+- [x] 更新 docs/performance/benchmarks.md 的快照版本与日期（历史 V100/A100/H100 标为 v0.4.0）
+- [x] 补齐 head_dim=128 的 benchmark 覆盖
 
 ## 阶段 2：一轮有数字的优化迭代
 
@@ -15,20 +15,28 @@
 
 - [ ] 双缓冲 / 异步拷贝（cp.async）隐藏 HBM 延迟
 - [ ] softmax 归约的 warp 级重构（减少 shared memory 往返）
-- [ ] causal mask 的边界块特化（跳过整块掩码判断）
+- [x] causal mask 的边界块特化（跳过整块掩码判断）——2026-08-18 E2b，
+      FP32 causal 实测约 ±2%，**诚实记录为噪声内负结果**，见
+      `docs/performance/causal-boundary-skip.md`
+- [x] grid.y > 65535 的 launch 越界修复 + 回归测试（E2a，B*H>65535）
 
-**完成证据**：与 PyTorch SDPA 的比值从当前 0.42×–0.67× 提升，且每一步优化有独立数字。
+**完成证据**：优化项有独立 before/after 数字。causal 跳过未把 SDPA 比值从
+0.42×–0.67× 抬上去，不把负结果改写成加速。
 
 ## 阶段 3：面向推理场景的扩展（面试加分项）
 
-- [ ] **FlashDecoding / Split-KV**：decode 阶段按 KV 分块并行 + reduce，这是推理加速面试高频主题
-- [ ] decode 场景（query_len=1）的专项 kernel 与 benchmark
+- [x] **FlashDecoding / Split-KV**：decode 阶段按 KV 分块并行 + reduce
+      （`src/forward/flash_decoding.cu`，数值测试 + benchmark）
+- [x] decode 场景（query_len=1）的专项 kernel 与 benchmark
 - [ ] （可选）BF16 路径的数值稳定性压测（长序列累积误差）
 
 ## 阶段 4：输出与沉淀
 
 - [ ] 写一篇深度文章：FlashAttention 前向/反向推导 + 本实现的优化过程与数字
 - [ ] 反向传播的数值稳定性说明文档（当前已有测试，补叙述）
+
+> **面试就绪冻结**（`phase-2-e`）：不再扩新功能。未勾选项（双缓冲、warp softmax、
+> BF16 长序列压测、深度文章）记入冻结清单，直到明确解冻。
 
 ## 面试讲述要点（完成后自查）
 
