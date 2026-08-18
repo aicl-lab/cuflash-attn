@@ -226,6 +226,61 @@ TEST(ForwardTest, CausalMultiHeadHeadDim128) {
     cudaFree(d_L);
 }
 
+// Causal forward with a non-tile-aligned sequence length (257 is not a
+// multiple of BLOCK_M/BLOCK_N = 64). Exercises the q_last =
+// min(q_start + BLOCK_M - 1, seq_len - 1) boundary computation: the last Q
+// block is partial and its future-KV skip must not over-retain or under-skip.
+TEST(ForwardTest, CausalNonTileAlignedSeqLen) {
+    const int batch_size = 1;
+    const int num_heads = 2;
+    const int seq_len = 257;
+    const int head_dim = 64;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+    size_t qkv_size = batch_size * num_heads * seq_len * head_dim;
+    size_t l_size = batch_size * num_heads * seq_len;
+
+    std::vector<float> h_Q(qkv_size), h_K(qkv_size), h_V(qkv_size);
+    std::mt19937 gen(1234);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    for (size_t i = 0; i < qkv_size; i++) {
+        h_Q[i] = dist(gen);
+        h_K[i] = dist(gen);
+        h_V[i] = dist(gen);
+    }
+
+    std::vector<float> h_O(qkv_size), h_L(l_size), ref_O(qkv_size);
+    reference_attention_forward(h_Q, h_K, h_V, ref_O, batch_size, num_heads, seq_len, head_dim,
+                                scale, /*causal=*/true);
+
+    float *d_Q, *d_K, *d_V, *d_O, *d_L;
+    ASSERT_EQ(cudaMalloc(&d_Q, qkv_size * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_K, qkv_size * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_V, qkv_size * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_O, qkv_size * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_L, l_size * sizeof(float)), cudaSuccess);
+
+    cudaMemcpy(d_Q, h_Q.data(), qkv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_K, h_K.data(), qkv_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_V, h_V.data(), qkv_size * sizeof(float), cudaMemcpyHostToDevice);
+
+    auto err = flash_attention_forward(d_Q, d_K, d_V, d_O, d_L, batch_size, num_heads, seq_len,
+                                       head_dim, scale, /*causal=*/true, 0);
+    ASSERT_EQ(err, FlashAttentionError::SUCCESS);
+
+    cudaDeviceSynchronize();
+    cudaMemcpy(h_O.data(), d_O, qkv_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+    float diff = max_abs_diff(h_O, ref_O);
+    EXPECT_LT(diff, 2e-3f) << "Max difference: " << diff;
+
+    cudaFree(d_Q);
+    cudaFree(d_K);
+    cudaFree(d_V);
+    cudaFree(d_O);
+    cudaFree(d_L);
+}
+
 // The forward pass must store a correct logsumexp L, not just a correct O:
 // the backward pass reconstructs softmax probabilities as exp(S - L), so a
 // wrong L silently corrupts every gradient. Verify L directly against a

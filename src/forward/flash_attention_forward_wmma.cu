@@ -79,10 +79,18 @@ __global__ void __launch_bounds__(WMMA_THREADS)
         __syncthreads();
 
         const int num_kv_blocks = (seq_len + BLOCK_N - 1) / BLOCK_N;
+
+        // causal：当前 Q 块最后可见位置。clamp 到 seq_len-1，避免最后一块
+        // 用未截断的 q_start + BLOCK_M - 1 做比较（对越界行过度保留）。
+        const int q_last = min(q_start + BLOCK_M - 1, seq_len - 1);
+
         for (int kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
             const int kv_start = kv_block * BLOCK_N;
 
-            if (causal && kv_start > q_start + BLOCK_M - 1) {
+            // causal：整块都在"未来"且后续块必然更远 → 直接结束循环。
+            // 只允许 break（块按 kv_start 递增），不允许 continue 跳过中间块；
+            // 部分重叠块仍由下方 kv <= q_row 的 mask 处理。
+            if (causal && kv_start > q_last) {
                 break;
             }
 
