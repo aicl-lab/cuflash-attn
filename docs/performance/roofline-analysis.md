@@ -1,6 +1,6 @@
 # Roofline 分析
 
-> **版本**: v0.4.0（标量路径分析快照；WMMA 路径见 tensor-core 迁移文档）  
+> **版本**: v1.0（HBM 流量模型已按本实现实际结构修正：固定 tile、K/V 按 Q block 重载；WMMA 路径见 tensor-core 迁移文档）  
 > **适用范围**: CuFlash-Attn 前向/反向 kernel，FP16，causal/non-causal  
 > **前置阅读**: [基准测试](./benchmarks.md)（含实测带宽与耗时数据）
 
@@ -100,51 +100,56 @@ FlashAttention（以本实现 v0.4.0 为例，采用 online softmax + tiling，�
 - 仅输出 $O$ 写回 HBM；中间量 $S, P$ 在 SRAM 内生成、消费、丢弃。
 - Online softmax 维护两个统计量：row max $m$ 与 row sum $l$。
 
-**访存分析**:
+**访存分析**（FA1 结构：一个 Q block 串行遍历全部 KV block，故 K/V 会按 Q block 数重载）：
 
 | 数据 | 大小 | 方向 | 次数 | 说明 |
 |------|------|------|------|------|
 | $Q$ | $B \cdot H \cdot N \cdot d$ | HBM $\to$ SRAM | 1 | 逐 tile 读取 |
-| $K$ | $B \cdot H \cdot N \cdot d$ | HBM $\to$ SRAM | $\lceil N / B_c \rceil$ | 外循环重载 |
-| $V$ | $B \cdot H \cdot N \cdot d$ | HBM $\to$ SRAM | $\lceil N / B_c \rceil$ | 与 $K$ 同步加载 |
+| $K$ | $B \cdot H \cdot N \cdot d$ | HBM $\to$ SRAM | $\lceil N / B_r \rceil$ | 每个 Q block 重读一遍 |
+| $V$ | $B \cdot H \cdot N \cdot d$ | HBM $\to$ SRAM | $\lceil N / B_r \rceil$ | 与 $K$ 同步重载 |
 | $O$ | $B \cdot H \cdot N \cdot d$ | SRAM $\to$ HBM | 1 | 最终输出 |
-| $m, l$ | $B \cdot H \cdot N$ | SRAM $\leftrightarrow$ HBM | 0 (SRAM 驻留) | 本实现在 tile 迭代中驻留 SRAM |
+| $m, l$ | $B \cdot H \cdot N$ | SRAM（驻留） | 0 | 本实现在 tile 迭代中驻留 SRAM |
 
-因此，对于 causal mask 场景（本实现支持），$K, V$ 的读取次数因下三角结构减半，总 HBM 流量近似为：
-
-$$
-Bytes_{FA} \approx \underbrace{2 \cdot B \cdot H \cdot N \cdot d}_{Q,O} + \underbrace{2 \cdot B \cdot H \cdot N \cdot d \cdot \frac{N}{B_c} \cdot \frac{1}{2}}_{K,V\;\text{causal 减半}} \approx 2 \cdot B \cdot H \cdot N \cdot d + B \cdot H \cdot N \cdot d \cdot \frac{N}{B_c}
-$$
-
-在典型 tiling 参数下（$B_c = 128$ 或 256），当 $N \gg B_c$ 时，第二项（$K, V$ 重载）不可忽略，但仍远小于 $O(N^2)$ 的 materialized $S, P$。
-
-**更简洁的上界估算**（参考 FlashAttention 原始论文）：
+因此，总 HBM 流量（以元素计）为：
 
 $$
-Bytes_{FA} \approx \Theta(B \cdot H \cdot N \cdot d)
+\text{HBM 流量} = \underbrace{2 \cdot B \cdot H \cdot N \cdot d}_{Q,O} + \underbrace{2 \cdot B \cdot H \cdot N \cdot d \cdot \left\lceil \frac{N}{B_r} \right\rceil}_{K,V\;\text{重载}}
+= \Theta\left(\frac{N^2 d}{B_r}\right)
 $$
 
-即 FlashAttention 的 HBM 流量从 $O(N^2)$ 降至 $O(N)$。
+其中 $B_r = \text{BLOCK}_M$ 固定为 64/32，所以**本实现的 HBM 流量是 $O(N^2)$**，
+只是常数小于 materialized attention 的 $O(N^2)$。
 
-**算术强度**:
-
-$$
-AI_{FA} = \frac{FLOPs_{FA}}{Bytes_{FA}} \approx \frac{4 \cdot B \cdot H \cdot N^2 \cdot d}{c \cdot B \cdot H \cdot N \cdot d} = \frac{4N}{c}
-$$
-
-其中 $c$ 为与 tiling 大小相关的常数（$c \approx 4 \sim 8$，取决于 $B_c, B_r$ 与 causal 掩码减少的访存）。
-
-代入 $N=8192, c=6$：
+**causal 场景**：每个 Q block 只需读取其对角线之前的 KV 行，K/V 重载约减半：
 
 $$
-AI_{FA} \approx \frac{4 \times 8192}{6} \approx 5460 \; \text{FLOP/Byte}
+\text{HBM 流量}_{\text{causal}} \approx 2 \cdot B \cdot H \cdot N \cdot d + B \cdot H \cdot d \cdot \frac{N^2}{B_r}
 $$
 
-> **注意**: 上述 $AI_{FA}$ 是**理论上限**，假设 $K, V$ 完全复用、无额外 index 计算开销。实际 kernel 中，causal mask 的边界判断、softmax 的 online rescaling、以及 SRAM bank conflict 会导致有效 $AI$ 下降 20%–40%。
+> **重要**：$\text{工作内存 / 中间激活}$ 是 $O(N)$（这是 FlashAttention 的核心收益），
+> 但**不要**把"显存占用 $O(N)$"误写成"HBM 流量 $O(N)$"。本实现没有 split-KV，
+> K/V 的重载次数不随 SRAM 容量增大而减少，因此 HBM 流量无法达到论文中
+> $\Theta(N^2 d^2 / M)$ 的最优标度。
+
+**算术强度**：
+
+$$
+AI_{FA} = \frac{FLOPs_{FA}}{\text{HBM Bytes}} \approx \frac{4 \cdot B \cdot H \cdot N^2 \cdot d}{c \cdot B \cdot H \cdot d \cdot \frac{N^2}{B_r} \cdot \text{bytes}} = \frac{4 B_r}{c \cdot \text{bytes}}
+$$
+
+其中 $c$ 为常数（$c \approx 2$，含 Q/O 项；$\text{bytes}$ 为每元素字节数）。以
+$B_r = 64$、FP16（2 字节/元素）估算，$AI_{FA} \approx 4 \times 64 / (2 \times 2) = 64$
+FLOP/Byte 量级——**与标准 attention 同阶**，远低于理论上的 $O(N)$。这正是固定 tile
+（无 split-KV）与论文最优实现的本质差距。
+
+> **注意**: 上述 $AI_{FA}$ 是**理论上限**，假设 K/V 完全复用（只在 HBM 读一次）。
+> 实际 kernel 中，causal mask 的边界判断、softmax 的 online rescaling、以及 SRAM
+> bank conflict 会导致有效 $AI$ 进一步下降。
 
 ### 3.3 为什么 FlashAttention 仍是 Memory-bound
 
-尽管 $AI_{FA} \approx 5460$ 看起来远大于 A100 的 ridge point（153），但在 Roofline 模型中必须区分**算法算术强度**与**有效算术强度**：
+本实现固定 tile（$B_r = 64/32$）下的理论 $AI_{FA}$ 与标准 attention 同阶（约几十
+FLOP/Byte，见 3.2），在 Roofline 模型中必须区分**算法算术强度**与**有效算术强度**：
 
 | 因素 | 对 $AI$ 的影响 | 说明 |
 |------|--------------|------|
@@ -153,12 +158,14 @@ $$
 | SRAM $\to$ Register / Shared Mem 流量 | **不纳入 HBM 流量** | Roofline 模型若使用 HBM-only 字节数，会高估 $AI$；若使用**全部内存层级流量**（含 shared memory），$AI$ 会大幅下降 |
 | 小 head_dim（$d=32$） | 降低 $AI$ | 每个元素的计算量减少，tiling 粒度受限 |
 
-**工程结论**: 在严格的 HBM-only Roofline 意义下，FlashAttention 的实测 $AI_{effective}$ 落在 **50–150 FLOP/Byte** 区间（见第 5 节实测表）。这意味着：
+**工程结论**: 本实现（无 split-KV，固定 tile）的 HBM 流量为 $O(N^2)$，算术强度不随
+$N$ 增长，因此**深处于 memory-bound 区域**。只有 FlashAttention-2/3 通过 split-KV /
+sequence-parallel 把 K/V 重载降下来，才能把 $AI$ 提高到 ridge point 附近。
 
-- 对于 V100（$AI_{ridge}=35$），FlashAttention 接近 ridge point，部分配置已触及 compute-bound 边缘。
-- 对于 A100/H100（$AI_{ridge}=153/295$），FlashAttention **仍位于 memory-bound 区域**，但已非常接近 ridge point。
-
-> **面试核心论点**: FlashAttention 的优化目标不是"变成 compute-bound"，而是"在 memory-bound 中做到最好"——通过 tiling 消除 $O(N^2)$ 的 HBM 流量，使得性能由**带宽上限** $P = \beta_{peak} \times AI$ 决定，而非由 $O(N^2)$ 的容量瓶颈决定。
+> **面试核心论点**: FlashAttention 的优化目标不是"变成 compute-bound"，而是"在
+> memory-bound 中做到最好"——工作内存从 $O(N^2)$ 降到 $O(N)$，使大 $N$ 变得可行；
+> 但**要诚实地指出**：固定 tile 的实现 HBM 流量仍是 $O(N^2)$，进一步减少 K/V 重载
+> 需要 split-KV（本仓库未实现）。
 
 ---
 
@@ -166,17 +173,21 @@ $$
 
 ### 4.1 无 Tiling 的访存灾难
 
-以 $N=16384, d=64, B=1, H=8$ 为例：
+以 $N=16384, d=64, B=1, H=8$，FP16（2 字节/元素）为例。本实现的 HBM 流量按 3.2 的
+K/V 重载模型计算（scalar 前向 hd64 取 $B_r = 64$，$q\_blocks = 256$）：
 
-| 指标 | 标准 Attention | FlashAttention (tiled) |
+| 指标 | 标准 Attention | FlashAttention (tiled, 本实现) |
 |:---|---:|---:|
 | $S = QK^T$ 大小 | $8 \times 16384^2 \times 2 \text{ Bytes} = 4.29 \text{ GB}$ | 0（SRAM 内消纳） |
 | $P = \text{softmax}(S)$ 大小 | $4.29 \text{ GB}$ | 0（SRAM 内消纳） |
-| 总 HBM 激活内存 | ~8.6 GB（仅 $S, P$）+ 64 MB（$Q,K,V,O$） | ~260 MB（仅 $Q,K,V,O$ 与 tile buffer） |
-| HBM 流量（读+写）| ~17.2 GB（单次前向） | ~520 MB（单次前向） |
-| 算术强度 $AI$ | $\approx d = 64$ | $\approx 200$–$800$（有效值） |
+| 总 HBM 激活内存 | ~8.6 GB（仅 $S, P$）+ 67 MB（$Q,K,V,O$） | ~67 MB（仅 $Q,K,V,O$ 与 $L$） |
+| HBM 流量（读+写，单次前向）| ~17.2 GB | $Q(16.8\text{ MB}) + O(16.8\text{ MB}) + K(256 \times 16.8\text{ MB}) + V(256 \times 16.8\text{ MB}) \approx 8.6 \text{ GB}$ |
+| 算术强度 $AI$ | $\approx d = 64$ | $\approx 64$（固定 tile，与标准同阶） |
 
-Tiling 的内存减幅达到 **30×–60×**，这是 FlashAttention 能处理长序列的根本原因。
+> **关键更正**：本实现（FA1 结构，固定 tile，无 split-KV）的 HBM 流量**不是** 520 MB
+> 量级，而是按 Q block 数重载 K/V 后的**数 GB 级**。FlashAttention 真正消除的是
+> $O(N^2)$ 的**显存占用**（$S, P$ 不落 HBM），而不是 $O(N^2)$ 的 **HBM 流量**。
+> causal 场景下 K/V 重载约减半，HBM 流量约为 4.3 GB。
 
 ### 4.2 Tiling 的算术强度提升机制
 
@@ -200,13 +211,14 @@ $$
 \underbrace{B_r \times d}_{Q\;tile} + \underbrace{2 \times B_c \times d}_{K,V\;tiles} + \underbrace{B_r \times B_c}_{S\;tile} + \underbrace{B_r}_{m\;vector} + \underbrace{B_r}_{l\;vector} + \underbrace{B_r \times d}_{O\;accumulator} \leq M_{SRAM}
 $$
 
-本实现 v0.4.0 选取 $B_r = 128, B_c = 128, d=64$，则 SRAM 占用约为：
+本实现 v0.4.0 的 scalar 前向在 $d=64$ 时选取 $B_r = 64, B_c = 64$，则 SRAM 占用约为：
 
 $$
-128 \times 64 + 2 \times 128 \times 64 + 128 \times 128 + 128 + 128 + 128 \times 64 = 8\text{K} + 16\text{K} + 16\text{K} + 0.5\text{K} + 0.5\text{K} + 8\text{K} \approx 49\text{KB}
+64 \times 64 + 2 \times 64 \times 64 + 64 \times 64 + 64 + 64 + 64 \times 64 = 4\text{K} + 8\text{K} + 4\text{K} + 0.1\text{K} + 0.1\text{K} + 4\text{K} \approx 20\text{KB}
 $$
 
-远小于 164 KB，留有余量给编译器插入的临时变量与 bank conflict 规避 padding。
+（FP16/BF16 的 WMMA 前向 tile 更小：hd64 为 $64 \times 32$。）远小于默认 48 KB 动态
+共享内存上限，留有余量给编译器插入的临时变量与 bank conflict 规避 padding。
 
 ---
 
@@ -214,7 +226,12 @@ $$
 
 ### 5.1 有效带宽利用率
 
-以下数据基于 [基准测试](./benchmarks.md) 的实测 kernel-only 时间，结合 `nvprof` / `ncu` 采集的 HBM 流量统计。测试配置：batch=1, heads=8, head_dim=64, causal FP16。
+以下数据是 v0.4.0 的历史快照（声称在 V100/A100/H100 上经 `nvprof`/`ncu` 采集）。
+> **注意**：该快照的"理论 HBM 流量"列按旧的"Q/K/V/O 各读一次"模型估算，**已被
+> 第 3.2 节的 K/V 重载模型取代**（固定 tile 下应为 $O(N^2)$ 量级），因此本表的
+> 有效带宽/利用率数值只作为旧快照参考。本仓库实际硬件（RTX 3060 / sm_86）的
+> 权威数据见 [validation-v1.0.md](./validation-v1.0.md)（T5 生成）。测试配置：
+> batch=1, heads=8, head_dim=64, causal FP16。
 
 | GPU | seq_len | 实测时间 (ms) | 理论 FLOPs | 实测 TFLOPS | 理论 HBM 流量 (GB) | 有效带宽 (GB/s) | 峰值带宽利用率 |
 |:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -254,26 +271,27 @@ $$
 
 ### 5.3 为什么 $AI_{eff}$ 与理论 $AI_{FA}$ 差距巨大
 
-理论上节推导 $AI_{FA} \approx 5460$ FLOP/Byte，而实测仅 4–6 FLOP/Byte，差距约 **1000×**。原因如下：
+第 3.2 节推导的本实现理论 $AI_{FA}$（固定 tile、FP16）约 64 FLOP/Byte 量级，而本仓库
+实测的 $AI_{eff}$ 往往更低（memory-bound、且有效利用率低于理论）。差距原因如下：
 
 | 因素 | 影响量级 | 解释 |
 |------|:-------:|------|
-| **HBM 流量定义差异** | $\times 50$–$100$ | 理论推导中 $Bytes_{FA}$ 仅计 $Q,K,V,O$；但实测中 ncu 统计的 HBM 流量包含：atomics、reduction scratchpad、kernel 启动参数、以及 PyTorch/CUDA context 的隐性流量。更关键的是，**shared memory 流量未被计入**，而 FlashAttention 的 tile 计算在 SRAM 内产生大量内部流量。 |
+| **HBM 流量定义差异** | $\times 2$–$10$ | 理论 $AI$ 只按逻辑字节（Q/K/V/O 元素数 × 字节数）计算；ncu 统计的物理 HBM 流量还包含 padding、非合并访问、kernel 启动参数等隐性流量。 |
 | **Causal mask 不规则性** | $\times 1.5$–$2$ | Causal mask 导致大量 warp 内线程闲置（padding 至三角形边界），有效 FLOPs 降低。 |
 | **Online softmax 额外访存** | $\times 1.2$ | $m, l$ 向量的频繁读写（即使驻留 SRAM，也有 register spilling 到 local memory 的情况）。 |
 | **短序列固定开销** | $\times 2$–$4$ | `seq_len=1K` 时，kernel launch、grid setup、边界条件判断的 overhead 占比极高。 |
 
-**修正后的 Roofline 分析应采用如下口径**：
+**正确的 HBM-only 算术强度口径**（本实现、固定 tile、无 split-KV）：
 
 $$
-AI_{HBM\text{-}only} = \frac{4 \cdot B \cdot H \cdot N^2 \cdot d}{2 \cdot B \cdot H \cdot N \cdot d \; (Q,O) + 2 \cdot B \cdot H \cdot N \cdot d \; (K,V\;\text{单次})} \approx N
+AI_{HBM\text{-}only} = \frac{4 \cdot B \cdot H \cdot N^2 \cdot d}{2 \cdot B \cdot H \cdot N \cdot d \; (Q,O) + 2 \cdot B \cdot H \cdot N \cdot d \cdot \lceil N / B_r \rceil \; (K,V\;\text{重载})}
+\approx \frac{2 B_r}{\text{bytes}}
 $$
 
-若以 $N=8192$ 计算，$AI_{HBM\text{-}only} \approx 8192$ FLOP/Byte，仍高于 ridge point。实测差距主要来源于：
-
-1. **本实现 v0.4.0 尚未实现 FlashAttention-2 的 split-K / sequence-parallel 优化**，导致 $K, V$ 的重载次数高于理论下限。
-2. **Google Benchmark 的 timer 精度与 warm-up 策略**在短序列下引入系统误差。
-3. **FP16 的 Tensor Core 利用率**: 本实现的 warp-level GEMM 使用手工编排的 HMMA 指令，但在小 $d$（32/64）时无法充分填满 MMA 单元，导致实际算力远低于 $\pi_{peak}$。
+与标准 attention 的 $AI \approx d$ 同阶（$B_r=64$、FP16 时约 64 FLOP/Byte），**不随
+$N$ 增长**。这与"$AI \approx O(N)$"的旧结论完全不同——旧结论假设 K/V 只读一次，
+对本实现（无 split-KV）不成立。要让 $AI$ 随 $N$ 增长，必须引入 split-KV /
+sequence-parallel（FlashAttention-2/3），把 K/V 重载降下来。
 
 ---
 
@@ -306,32 +324,38 @@ Performance (TFLOPS)
       1    10    50   100   153   500   1000
 
 Standard Attention (seq=16K):  X @ AI≈64,  P≈0.13 TFLOPS
-FlashAttention v0.4.0 (seq=16K): O @ AI≈5*  P≈9.3 TFLOPS
-FlashAttention-2 (参考):        △ @ AI≈80*, P≈80+ TFLOPS
+FlashAttention (本实现, seq=16K): O @ AI≈64 (固定 tile, O(N²) HBM), P≈9.3 TFLOPS (v0.4.0 快照)
+FlashAttention-2 (参考):        △ @ AI≈O(N),  P≈80+ TFLOPS
 
-* 有效 AI（含全部内存层级）
+* 本实现 HBM 流量为 O(N²)，AI 不随 N 增长；FA2/3 的 split-KV 才降到 O(N)。
 ```
 
 ### 6.2 对比汇总表
 
-| 维度 | 标准 Attention (Materialized) | CuFlash-Attn v0.4.0 | FlashAttention-2/3 (生产级) |
+| 维度 | 标准 Attention (Materialized) | CuFlash-Attn（本实现，固定 tile） | FlashAttention-2/3 (生产级) |
 |:---|:---|:---|:---|
-| $AI$ (HBM-only) | $O(d) \approx 64$ | $O(N/d) \approx 5000$ | $O(N/B_c) \approx 5000$ |
-| $AI_{eff}$ (全内存层级) | $\approx 3$–$5$ | $\approx 4$–$6$ | $\approx 50$–$150$ |
-| HBM 流量 scaling | $O(N^2)$ | $O(N)$ | $O(N)$ |
-| A100 峰值带宽利用率 | 20%–35% | 60%–96% | 85%–110% |
-| A100 实测 TFLOPS | 1.5–3.0 | 4.5–9.3 | 80–150+ |
+| $AI$ (HBM-only) | $O(d) \approx 64$ | $O(2B_r/\text{bytes}) \approx 64$（固定 tile，**不随 $N$ 增长**） | $O(N/B_c)$（split-KV 后大幅提高） |
+| HBM 流量 scaling | $O(N^2)$ | **$O(N^2)$**（固定 tile，常数更小） | **$O(N)$** / split-KV 后大幅降低 |
+| 工作内存（显存占用） | $O(N^2)$ | $O(N)$ | $O(N)$ |
+| A100 峰值带宽利用率 * | 20%–35% | 60%–96%（v0.4.0 历史快照） | 85%–110% |
+| A100 实测 TFLOPS * | 1.5–3.0 | 4.5–9.3（v0.4.0 历史快照） | 80–150+ |
 | 最大 seq_len (40GB) | ~8K–16K | ~64K | ~128K–256K |
-| Roofline Regime | Deep memory-bound, 低效 | Memory-bound, 中等效率 | Near ridge point / 部分 compute-bound |
+| Roofline Regime | Deep memory-bound, 低效 | Memory-bound | Near ridge point / 部分 compute-bound |
+
+> * 带 * 的行是 v0.4.0 历史快照（非本仓库硬件实测），仅作量级参考；权威实测见
+> [validation-v1.0.md](./validation-v1.0.md)。
 
 ### 6.3 定性结论
 
 1. **标准 Attention** 位于 Roofline 极左下角。即使给它无限算力，也无法突破 $P = \beta \times AI$ 的斜线限制；且 $AI$ 固定为 $O(d)$，不随 $N$ 增长，**不具备 scaling 潜力**。
 
-2. **CuFlash-Attn v0.4.0** 通过 tiling 将 $AI$ 提升数个数量级，但受限于参考级实现的手工程度，未能完全消除多余 HBM 流量与 warp 闲置。其性能位于 Roofline 斜线上段，距离 ridge point 仍有一个数量级的差距。
+2. **本实现（固定 tile）** 的核心收益是**工作内存**从 $O(N^2)$ 降到 $O(N)$，使长序列
+   变得可行；但 HBM 流量仍是 $O(N^2)$，$AI$ 与标准 attention 同阶、不随 $N$ 增长，
+   因此深处于 memory-bound 区域。这是 FA1 结构 + 固定 tile 的固有上限。
 
-3. **FlashAttention-2/3** 通过以下手段进一步右移 $AI$：
-   - **Split-K / Sequence Parallel**: 将 $K, V$ 的冗余加载分摊到多个 warp group。
+3. **FlashAttention-2/3** 通过以下手段真正把 HBM 流量降下来：
+   - **Split-K / Sequence Parallel**: 将 $K, V$ 的冗余加载分摊到多个 warp group，把
+     HBM 流量从 $O(N^2)$ 降到 $O(N)$。
    - **Grouped GEMM / Warp Specialization**: 减少 softmax 与 GEMM 之间的流水线气泡。
    - **TMA (Hopper) / cp.async (Ampere)**: 异步预取隐藏 HBM 延迟。
    - **精确 causal mask 处理**: 避免 tile 内的无效计算与访存。
@@ -342,12 +366,15 @@ FlashAttention-2 (参考):        △ @ AI≈80*, P≈80+ TFLOPS
 
 ## 7. 优化路线图（从 Roofline 视角）
 
-| 阶段 | 目标 $AI_{eff}$ | 手段 | 预期 A100 带宽利用率 | 难度 |
-|:---|:---:|:---|:---:|:---:|
-| v0.4.0 (当前) | 4–6 | 基础 tiling + online softmax | 60%–96% | 基线 |
-| v0.4.0 | 15–25 | `cp.async` 预取、更优 warp 调度、causal mask 边界优化 | 85%–100% | 中 |
-| v0.5.0 | 40–80 | Split-K sequence parallel、warp-group 级 reduction、减少 bank conflict | 95%–110% | 高 |
-| v1.0.0 (未来) | 100+ | CUTLASS 集成或 TMA/WGMMA 重写（Hopper） | 接近 ridge point | 极高 |
+> 本仓库 v1.0 冻结为教学/参考实现，以下路线图**不在本仓库实施**（见 PLAN.md 的
+> Phase B 界定），仅记录从 Roofline 视角看后续可以怎么走。
+
+| 阶段 | 目标 | 手段 | 预期收益 | 难度 |
+|:---|:---|:---|:---:|:---:|
+| v1.0 (当前) | 正确、可复现的基线 | 基础 tiling + online softmax + 前向 WMMA | 工作内存 $O(N)$，HBM 流量 $O(N^2)$（诚实口径） | 基线 |
+| 优化 1 | 降低 K/V 重载 | `cp.async` 预取、更优 warp 调度、causal mask 边界优化 | 隐藏 HBM 延迟 | 中 |
+| 优化 2 | 把 HBM 流量降到 $O(N)$ | split-KV / sequence-parallel、warp-group 级 reduction | $AI$ 随 $N$ 增长，接近 ridge point | 高 |
+| 未来 | 接近 ridge point | CUTLASS 集成或 TMA/WGMMA 重写（Hopper） | 生产级 | 极高 |
 
 ---
 

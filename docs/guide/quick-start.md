@@ -5,7 +5,7 @@
 ## 前置条件
 
 - NVIDIA GPU，计算能力 7.0+ (V100, RTX 20/30/40 系列, A100, H100)
-- CUDA Toolkit 11.0 或更高版本
+- CUDA Toolkit 11.8 或更高版本（推荐 12.x；sm_90 需 11.8+；CUDA 13.x 已移除 sm_70）
 - CMake 3.18 或更高版本
 - C++17 兼容编译器
 

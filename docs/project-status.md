@@ -5,7 +5,8 @@ CuFlash-Attn 当前维护为 **稳定的 v0.5.0 参考实现**，适合学习、
 ## 保留范围
 
 - 从零实现的 CUDA C++ FlashAttention
-- `float` 与 `half` 的前向、反向传播
+- `float`、`half`、`__nv_bfloat16`（BF16）的前向、反向传播
+- 前向的 FP16/BF16 在支持架构上走 WMMA（Tensor Core）路径
 - 支持的 `head_dim`：`32`、`64`、`128`
 - 面向 C++ 与 `ctypes` 的稳定公开接口
 - 双语技术文档与 GitHub Pages

@@ -144,12 +144,17 @@ graph LR
 
 ### 分块维度
 
-| 参数 | 描述 | 典型值 |
-|------|------|--------|
-| `B_r` | Query 分块大小 | 128 |
-| `B_c` | Key/Value 分块大小 | 64 |
-| `D` | 头维度 | 64, 128 |
-| `T_r` | 每 Query 分块线程数 | 128 |
+前向 tile 集中定义在 `src/kernels/impl/tile_io.cuh`（`ForwardTilingConfig`）：
+
+| 参数 | 描述 | scalar 前向 | WMMA 前向 |
+|------|------|-------------|-----------|
+| `B_r` | Query 分块大小 | 64（hd128 为 32） | 64（hd128 为 32） |
+| `B_c` | Key/Value 分块大小 | 64（hd128 为 32） | 32 |
+| `D` | 头维度 | 32, 64, 128 | 32, 64, 128 |
+| `T_r` | 每 Query 分块线程数 | 128 | 128 |
+
+反向使用更保守的 `BackwardTilingConfig`（shared memory 要容纳更多梯度张量），例如
+hd128 为 $16 \times 32$，hd64 为 $32 \times 32$。
 
 ### 内存复杂度
 
@@ -157,11 +162,14 @@ $$
 \text{SRAM} = O(B_r \times D + B_c \times D + B_r \times B_c)
 $$
 
-对于典型值 ($B_r=128, B_c=64, D=128$)：
+例如 scalar 前向 ($B_r=64, B_c=64, D=64$，FP32)：
 
 $$
-\text{SRAM} = 128 \times 128 + 64 \times 128 + 128 \times 64 = 32\text{KB}
+\text{SRAM 元素} = 64 \times 64 \;(Q) + 64 \times 64 \;(K) + 64 \times 64 \;(V) + 64 \times 64 \;(S) + 64 \times 64 \;(O) + 64 + 64 = 20608
 $$
+
+即 $\approx 80$ KB（超过默认 48 KB 上限时由 launcher opt-in 动态共享内存），精确值见
+`ForwardTilingConfig::smem_bytes`。
 
 ---
 
@@ -170,23 +178,25 @@ $$
 ```
 cuflash-attn/
 ├── include/cuflash/          # 公开 API 头文件
-│   ├── flash_attention.h     # C++ 命名空间 API
-│   └── flash_attention_c.h   # C ABI
+│   ├── flash_attention.h     # C++ 命名空间 API（含 C ABI 声明）
+│   ├── export.h              # 可见性宏
+│   └── version.h.in          # 版本头文件模板
 ├── src/
 │   ├── api/                  # API 调度层
 │   │   └── flash_attention_api.cu
-│   ├── forward/              # 前向内核
-│   │   ├── forward_kernel_f32.cu
-│   │   └── forward_kernel_f16.cu
-│   ├── backward/             # 反向内核
-│   │   ├── backward_kernel_f32.cu
-│   │   └── backward_kernel_f16.cu
+│   ├── forward/              # 前向内核（统一模板）
+│   │   ├── flash_attention_forward_typed.cu   # FP32/FP16/BF16 scalar 前向
+│   │   └── flash_attention_forward_wmma.cu    # FP16/BF16 WMMA（Tensor Core）前向
+│   ├── backward/             # 反向内核（统一模板，scalar）
+│   │   └── flash_attention_backward_typed.cu
 │   └── kernels/              # 共享工具
-│       ├── softmax.cuh
-│       └── memory.cuh
+│       ├── impl/             # 内部实现细节（tiling 配置、online softmax、type adapter）
+│       ├── matmul.cu / online_softmax.cu / tile_io.cu
+│       └── kernel_launch_utils.cuh
 └── tests/
-    ├── unit/                  # 单元测试
-    └── integration/           # 集成测试
+    ├── unit/                  # 单元测试（gtest）
+    ├── integration/           # API smoke + PyTorch 对比
+    └── package_smoke/         # 安装包冒烟
 ```
 
 ---

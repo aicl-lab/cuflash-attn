@@ -1,6 +1,6 @@
 # Tensor Core 迁移计划
 
-> 状态：**Phase 2（前向）已实现** —— FP16/BF16 的 WMMA 前向 kernel 已在 v0.5.0 落地（`src/forward/flash_attention_forward_wmma.cu`），带运行时分派，标量路径保留为 fallback。真实硬件上的数值验证（测试套件 + compute-sanitizer + benchmark）待 GPU 工作流执行；下一步是 backward 的 WMMA 化（Phase 2 后续）。每个阶段都设计为可在真实硬件上独立落地并验证。
+> 状态：**Phase 2（前向）已实现** —— FP16/BF16 的 WMMA 前向 kernel 已在 v0.5.0 落地（`src/forward/flash_attention_forward_wmma.cu`），带运行时分派，标量路径保留为 fallback。单元测试套件（`ctest`）在本机 sm_86（RTX 3060）上通过；真实硬件的数值对比、benchmark 与 compute-sanitizer 结果见 `docs/performance/validation-v1.0.md`。**Backward 的 WMMA 化明确不纳入 v1.0**（保持 scalar），后续阶段另议。每个阶段都设计为可在真实硬件上独立落地并验证。
 
 ## 为什么需要它
 
@@ -9,9 +9,8 @@ CuFlash-Attn 正确但慢。kernel 把每个 matmul 都写成朴素标量循环�
 softmax/`P@V` 段更是**一个线程包办一整行 query**（`src/forward/flash_attention_forward_typed.cu`）。
 没有 Tensor Core、没有 `cp.async`、没有寄存器分块、没有 warp 级协作。
 
-对一个低精度注意力 kernel 而言，约 90% 的可达吞吐来自 Tensor Core。在用上它们之前，README 里
-"高性能" 的说法只是愿景而非事实。本文把它变成事实的路径拆成若干阶段，每个阶段都先编译通过、
-跑通现有测试、并看到可测量的加速，再进入下一阶段。
+对一个低精度注意力 kernel 而言，约 90% 的可达吞吐来自 Tensor Core。本文档把这条路径拆成
+若干阶段，每个阶段都先编译通过、跑通现有测试、并看到可测量的加速，再进入下一阶段。
 
 **每个阶段的铁律**：在现有测试（`test_forward`、`test_backward`、`test_dtype`、PyTorch 对比）
 和 `scripts/run_compute_sanitizer.sh` 全部通过之后再往前走。不要叠加未验证的改动。

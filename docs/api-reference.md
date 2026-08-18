@@ -10,9 +10,11 @@ CuFlash-Attn 提供简洁的 C++ API，所有函数和类型定义在 `cuflash` 
 - [前向传播](#前向传播)
   - [FP32 前向](#flash_attention_forward-fp32)
   - [FP16 前向](#flash_attention_forward-fp16)
+  - [BF16 前向](#flash_attention_forward-bf16)
 - [反向传播](#反向传播)
   - [FP32 反向](#flash_attention_backward-fp32)
   - [FP16 反向](#flash_attention_backward-fp16)
+  - [BF16 反向](#flash_attention_backward-bf16)
 - [C ABI 接口](#c-abi-接口)
 - [张量布局](#张量布局)
 - [错误处理](#错误处理)
@@ -28,7 +30,11 @@ CuFlash-Attn 提供简洁的 C++ API，所有函数和类型定义在 `cuflash` 
 #include "cuflash/flash_attention.h"
 ```
 
-所有公共 API 均通过此单一头文件暴露。
+所有公共 API 均通过此单一头文件暴露。**`include/cuflash/flash_attention.h` 是唯一权威
+签名来源**；本文档若与头文件不一致，以头文件为准。
+
+> 完整的前向/反向签名覆盖 FP32 (`float`)、FP16 (`half`)、BF16 (`__nv_bfloat16`)
+> 三种 dtype，本文档按 dtype 分节列出。
 
 ---
 
@@ -103,6 +109,37 @@ FlashAttentionError flash_attention_forward(
 - 最终结果：FP16
 
 此方法在减少内存带宽需求的同时，提供了与 FP32 相当的数值稳定性。
+在支持架构（sm_70+）上前向走 WMMA（Tensor Core）路径。
+
+---
+
+### `flash_attention_forward` (BF16)
+
+计算 BF16 精度的 FlashAttention 前向传播。内部计算使用 FP32 以确保数值稳定性，输出转换回 BF16。
+
+```cpp
+FlashAttentionError flash_attention_forward(
+    const __nv_bfloat16* Q,      // 查询张量 [B, H, N, D]
+    const __nv_bfloat16* K,      // 键张量 [B, H, N, D]
+    const __nv_bfloat16* V,      // 值张量 [B, H, N, D]
+    __nv_bfloat16* O,            // 输出张量 [B, H, N, D]
+    float* L,                    // logsumexp [B, H, N]（始终为 FP32）
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    float scale,
+    bool causal,
+    cudaStream_t stream = 0
+);
+```
+
+**精度处理：**
+- 输入/输出：BF16（`__nv_bfloat16`）
+- 内部计算：FP32（32 位单精度）
+- 最终结果：BF16
+
+在支持架构（sm_80+）上前向走 WMMA（Tensor Core）路径。
 
 ---
 
@@ -173,6 +210,39 @@ FlashAttentionError flash_attention_backward(
 - 内部累加使用 FP32 以防止溢出
 - 最终梯度转换为 FP16
 - 数值稳定性与 FP32 反向传播相当
+
+---
+
+### `flash_attention_backward` (BF16)
+
+计算 BF16 精度的 FlashAttention 反向传播梯度（scalar 路径）。
+
+```cpp
+FlashAttentionError flash_attention_backward(
+    const __nv_bfloat16* Q,
+    const __nv_bfloat16* K,
+    const __nv_bfloat16* V,
+    const __nv_bfloat16* O,
+    const float* L,
+    const __nv_bfloat16* dO,
+    __nv_bfloat16* dQ,
+    __nv_bfloat16* dK,
+    __nv_bfloat16* dV,
+    int batch_size,
+    int num_heads,
+    int seq_len,
+    int head_dim,
+    float scale,
+    bool causal,
+    cudaStream_t stream = 0
+);
+```
+
+**实现说明：**
+- 内部累加使用 FP32 以防止溢出
+- 最终梯度转换为 BF16
+- 数值稳定性与 FP32 反向传播相当
+- 反向目前全部为 scalar 路径（backward WMMA 不纳入 v1.0）
 
 ---
 
@@ -252,6 +322,7 @@ size_t offset = (b * num_heads + h) * seq_len + s;
 
 - **float**：32 位 IEEE 754 单精度浮点数
 - **half**：16 位 IEEE 754 半精度浮点数（CUDA 原生）
+- **`__nv_bfloat16`**：16 位 Brain Float（CUDA 原生，`cuda_bf16.h`）
 - 所有指针必须指向连续的设备内存
 
 ---
@@ -332,7 +403,7 @@ int main() {
 | 参数 | 支持的值 |
 |------|----------|
 | `head_dim` | 32、64、128 |
-| 数据类型 | `float` (FP32)、`half` (FP16) |
+| 数据类型 | `float` (FP32)、`half` (FP16)、`__nv_bfloat16` (BF16) |
 | 因果掩码 | 可选（`bool causal`） |
 | 批大小 | ≥ 1 |
 | 注意力头数 | ≥ 1 |
@@ -342,8 +413,9 @@ int main() {
 
 | 数据类型 | 前向传播 | 反向传播 |
 |----------|----------|----------|
-| `float` (FP32) | ✅ 完全支持 | ✅ 完全支持 |
-| `half` (FP16) | ✅ 完全支持 | ✅ 完全支持 |
+| `float` (FP32) | ✅ 完全支持（scalar） | ✅ 完全支持（scalar） |
+| `half` (FP16) | ✅ 完全支持（sm_70+ WMMA / scalar fallback） | ✅ 完全支持（scalar） |
+| `__nv_bfloat16` (BF16) | ✅ 完全支持（sm_80+ WMMA / scalar fallback） | ✅ 完全支持（scalar） |
 
 ---
 
@@ -402,15 +474,17 @@ cmake --preset release -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --preset release -DCMAKE_CUDA_ARCHITECTURES="80;86;89"
 ```
 
-### 共享内存需求
+### 共享内存需求（scalar 前向，FP32）
 
 | head_dim | SRAM 需求 | 典型块大小 |
 |----------|-----------|-----------|
-| 32 | ~32 KB | 64 × 64 |
-| 64 | ~64 KB | 64 × 64 |
-| 128 | ~128 KB | 32 × 32 |
+| 32 | ~48 KB | 64 × 64 |
+| 64 | ~80 KB | 64 × 64 |
+| 128 | ~68 KB | 32 × 32 |
 
-注意：head_dim=128 需要支持扩展共享内存的 GPU。
+注意：hd64/hd128 超过默认 48 KB 动态共享内存上限，launcher 通过
+`cudaFuncSetAttribute` 申请 opt-in 动态共享内存（sm_86 上限 100 KB）。
+FP16/BF16 的 WMMA 前向 tile 更小（hd64 为 64×32）。
 
 ---
 

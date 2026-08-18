@@ -20,19 +20,24 @@ Kernel 的 tiling、共享内存占用和寄存器压力都依赖编译期常量
 
 ---
 
-## ADR-2：FP16 路径内部统一使用 FP32 累加
+## ADR-2：低精度输入、FP32 累加；WMMA 前向的 tile 保持输入精度
 
 **背景**  
 Attention 分数累加和 online softmax 在半精度下容易出现精度损失与数值不稳定。
 
 **决策**  
-GMEM 边界可使用 `half`，但内部累加、归一化和关键中间值统一使用 `float`。
+- 低精度（FP16/BF16）输入在 GMEM 边界保持输入精度，内部**累加、归一化和关键中间值
+  统一使用 `float`（FP32）**。
+- v0.5.0 起，FP16/BF16 **前向**在支持架构上走 WMMA（Tensor Core）路径：Q/K/V tile
+  在 shared memory 中**保持输入精度**，MMA 以 FP32 累加，softmax 后将 $P$ 量化为输入
+  精度做 $PV$。scalar fallback 仍为"加载转 FP32、CUDA core 计算"。
 
 **影响**
 
 - 长序列下更稳定
 - 内部资源压力略增
 - FP16/FP32 两条路径的行为更一致
+- WMMA 前向把两次大矩阵乘放到 Tensor Core 上（FP16 需 sm_70+，BF16 需 sm_80+）
 
 ---
 

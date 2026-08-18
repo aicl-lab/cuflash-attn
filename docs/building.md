@@ -22,7 +22,7 @@
 
 | 依赖 | 最低版本 | 说明 |
 |------|----------|------|
-| **CUDA Toolkit** | 11.2 | 包含 nvcc 编译器和 CUDA 库。CUDA 13.x 移除了 sm_70（Volta），如需 V100 支持请用 CUDA 12.x 构建 |
+| **CUDA Toolkit** | 11.8 | 包含 nvcc 编译器和 CUDA 库（推荐 12.x；sm_90 需 11.8+；CUDA 13.x 移除了 sm_70（Volta），如需 V100 支持请用 CUDA 12.x 构建） |
 | **CMake** | 3.18（preset 需 3.20） | 构建系统生成器 |
 | **C++ 编译器** | C++17 | GCC 7+、Clang 5+、MSVC 2017+ |
 | **Python**（可选） | 3.8+ | 用于 PyTorch 对比测试 |
@@ -138,6 +138,8 @@ cmake --preset release `
 | `ENABLE_RAPIDCHECK` | OFF | 启用 RapidCheck 基于属性的测试 |
 | `BUILD_SHARED_LIBS` | ON | 构建为共享库（`*.so`/`.dll`/`.dylib`） |
 | `BUILD_EXAMPLES` | ON | 构建示例程序 |
+| `BUILD_BENCHMARKS` | ON | 构建 Google Benchmark 基准测试（`cuflash_attn_bench`） |
+| `CMAKE_CUDA_ARCHITECTURES` | `80;86` | 目标 GPU 架构，如 `-DCMAKE_CUDA_ARCHITECTURES=86` |
 | `ENABLE_FAST_MATH` | OFF | 启用 `--use_fast_math` 编译器标志 |
 
 ### ENABLE_FAST_MATH
@@ -192,17 +194,17 @@ ctest --preset release -V
 
 ### GoogleTest 直接运行
 
-测试位于 `build/<preset>/tests/`：
+测试二进制位于 `build/<preset>/`：
 
 ```bash
 # 运行所有测试
-./build/release/tests/cuflash_attn_tests
+./build/release/cuflash_attn_tests
 
 # 运行特定测试套件
-./build/release/tests/cuflash_attn_tests --gtest_filter="ForwardTest*"
+./build/release/cuflash_attn_tests --gtest_filter="ForwardTest*"
 
 # 列出所有可用测试
-./build/release/tests/cuflash_attn_tests --gtest_list_tests
+./build/release/cuflash_attn_tests --gtest_list_tests
 ```
 
 ### PyTorch 对比测试
@@ -214,7 +216,7 @@ ctest --preset release -V
 cmake --preset release
 
 # 运行对比测试
-python tests/test_pytorch_comparison.py
+python tests/integration/test_pytorch_comparison.py
 ```
 
 **库路径解析：**
@@ -224,7 +226,7 @@ python tests/test_pytorch_comparison.py
 
 **自定义库路径：**
 ```bash
-CUFLASH_LIB=/path/to/libcuflash_attn.so python tests/test_pytorch_comparison.py
+CUFLASH_LIB=/path/to/libcuflash_attn.so python tests/integration/test_pytorch_comparison.py
 ```
 
 ---
@@ -332,7 +334,7 @@ RUN cmake --preset release && \
 运行：
 ```bash
 docker build -t cuflash-attn .
-docker run --gpus all cuflash-attn ./build/release/tests/cuflash_attn_tests
+docker run --gpus all cuflash-attn ./build/release/cuflash_attn_tests
 ```
 
 ---

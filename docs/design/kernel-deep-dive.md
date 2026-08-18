@@ -1,5 +1,13 @@
 # Kernel 逐行解读
 
+> **适用范围说明**：本文档逐行解读的是 **scalar（CUDA core）路径**——FP32 前向/反向
+> 全部，以及低精度在不支持 WMMA 的架构上的 fallback。自 v0.5.0 起，FP16/BF16 **前向**
+> 在 sm_70+/sm_80+ 上默认走 **WMMA（Tensor Core）路径**
+> （`src/forward/flash_attention_forward_wmma.cu`）：Q/K/V tile 保持输入精度、
+> 两个大矩阵乘在 Tensor Core 上执行（FP32 累加），online softmax 与延迟归一化仍在
+> CUDA core 上完成。本文档下述的 SMEM 布局（全 `float`）与 `matmul_ABt` 仅对应 scalar
+> 路径；WMMA 路径的布局与分派见 [tensor-core-migration.md](./tensor-core-migration.md)。
+
 本文档逐行拆解 CuFlash-Attn 的 CUDA kernel 实现，覆盖从 launch configuration 到 warp-level 指令流水的全部细节。所有结论均直接对应源码，不作模糊表述。
 
 ---

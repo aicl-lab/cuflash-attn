@@ -14,7 +14,7 @@ FlashAttention 是一种 IO-aware 的精确注意力算法，将内存复杂度�
 - [前向传播算法](#前向传播算法)
 - [反向传播算法](#反向传播算法)
 - [因果掩码](#因果掩码)
-- [FP16 实现](#fp16-实现)
+- [FP16/BF16 实现](#fp16bf16-实现)
 - [内存复杂度分析](#内存复杂度分析)
 - [实现亮点](#实现亮点)
 - [参考文献](#参考文献)
@@ -200,42 +200,73 @@ $$
 
 ---
 
-## FP16 实现
+## FP16/BF16 实现
 
-本实现完整支持 FP16（半精度）的前向与反向传播。
+本实现支持 FP32 / FP16 / BF16 的前向与反向传播。自 v0.5.0 起，FP16（sm_70+）与
+BF16（sm_80+）的**前向**在支持 Tensor Core 的架构上走 **WMMA 路径**。
 
-### 实现策略
+### WMMA 前向（默认路径，sm_70+ / sm_80+）
 
-FP16 输入在内部转为 FP32 计算，最终输出转回 FP16：
+- Q/K/V tile 在 shared memory 中**保持输入精度**（`half` / `__nv_bfloat16`）；
+- $S = QK^T$ 与 $O \mathrel{+}= P V$ 的矩阵乘法在 Tensor Core 上执行
+  （m16n16k16，FP32 累加）；
+- online softmax 与 FA2 延迟归一化仍在 CUDA core 上以 FP32 完成；
+- softmax 后把 $P$ 量化为**输入精度**再做 $PV$。
+
+$$
+\text{输入: } \texttt{half}^*/\texttt{bf16}^*\; Q, K, V
+\xrightarrow{\text{加载}} \text{输入精度 tile} \xrightarrow{\text{MMA (FP32 累加)}} \text{FP32 累加器}
+\xrightarrow{\text{存储}} \texttt{half}^*/\texttt{bf16}^*\; O,\; \texttt{float}^*\; L
+$$
+
+### Scalar fallback（FP32 全程；或低精度在不支持 WMMA 的架构上）
+
+- 输入在加载时转为 FP32，CUDA core 计算，FP32 累加，输出转回输入精度：
 
 $$
 \text{输入: } \texttt{half}^* \; Q, K, V \xrightarrow{\text{加载}} \text{FP32 寄存器} \xrightarrow{\text{计算}} \text{FP32 累加器} \xrightarrow{\text{存储}} \texttt{half}^* \; O, L
 $$
 
+**反向**（三 dtype 一致）目前全部为 scalar 路径：输入加载转 FP32、FP32 累加。
+
 ### 数值精度
 
-| 操作 | 精度 |
-|------|------|
-| 矩阵乘法 ($Q \times K^T$) | FP32 |
-| Softmax 计算 | FP32 |
-| 累加 | FP32 |
-| 最终输出 | FP16 |
+| 操作 | WMMA 前向 | scalar 路径 |
+|------|----------|-------------|
+| 矩阵乘法 ($Q \times K^T$) | Tensor Core，FP32 累加 | FP32 |
+| Softmax 计算 | FP32 | FP32 |
+| 累加 | FP32 | FP32 |
+| 最终输出 | FP16/BF16 | FP16/BF16 |
 
 **优势：**
-- 数值稳定性与 FP32 相当。
-- 内存带宽减半（张量缩小 2 倍）。
-- 所有现代 GPU 均支持（compute capability $\geq$ 5.3）。
+- 低精度输入把 HBM 流量减半（张量缩小 2 倍）。
+- WMMA 路径把两次大矩阵乘放到 Tensor Core 上（FP16 需 compute capability $\geq$ 7.0，BF16 需 $\geq$ 8.0）。
 
 ---
 
 ## 内存复杂度分析
 
-| 方法 | 前向内存 | 反向内存 | HBM IO |
+> 必须区分两种不同的量：
+> - **工作内存 / 中间激活**（SRAM 之外需要物化的数据量）是 $O(N)$；
+> - **HBM 流量**（实际读写设备内存的字节数）对本实现**仍是 $O(N^2)$**，
+>   只是常数小于 materialized attention。
+
+| 方法 | 前向内存 | 反向内存 | HBM 流量 |
 |------|----------|----------|--------|
 | 标准注意力 | $O(N^2)$ | $O(N^2)$ | $O(N^2 + Nd)$ |
-| FlashAttention | $O(N)$ | $O(N)$ | $O\left(\frac{N^2 d^2}{M}\right)$ |
+| 本实现（固定 tile） | $O(N)$ | $O(N)$ | $\Theta\left(\frac{N^2 D}{\text{BLOCK}_M} + ND\right)$（固定 tile 下即 $O(N^2)$） |
 
-其中 $M$ 为 SRAM 容量。当 $M = \Theta(Nd)$ 时，IO 复杂度趋近 $O(Nd)$，这是最优的，因为仅输入输出就需 $\Theta(Nd)$。
+本实现是 FA1 结构：一个 Q block 串行遍历全部 KV block，Q 读 1 次、O 写 1 次，
+每个 Q block 都会把 K/V 各重读一遍：
+
+$$
+\text{HBM 流量} = Q(1\text{ 次}) + O(1\text{ 次}) + (K+V) \times \left\lceil \frac{N}{\text{BLOCK}_M} \right\rceil
+= \Theta\left(\frac{N^2 D}{\text{BLOCK}_M}\right)
+$$
+
+其中 $\text{BLOCK}_M$ 固定为 64/32。论文中 $\Theta(N^2 D^2 / M)$ 的结论需要 block
+size 随 SRAM 容量合理放大（即 $M$ 与 block 大小同阶增长）才成立；当前固定 tile
+的实现并没有达到。FlashAttention-2 的 split-KV 进一步减少 K/V 重载，本仓库**没有实现**。
 
 ### 实际内存节省
 
@@ -245,17 +276,25 @@ $$
 | 4,096 | 64 MB | 32 KB | **99.95%** |
 | 16,384 | 1 GB | 128 KB | **99.99%** |
 
+> 上表是**显存占用**的对比，不是 HBM 流量。工作内存为 $O(N)$ 是 FlashAttention
+> 的核心收益；但本实现（无 split-KV）的 HBM 流量仍为 $O(N^2)$，见上文。
+
 ---
 
 ## 实现亮点
 
 ### 分块配置
 
-| head_dim | $B_r$ | $B_c$ | 每块 SRAM |
-|----------|-------|-------|----------|
-| 32 | 64 | 64 | $\sim$32 KB |
-| 64 | 64 | 64 | $\sim$64 KB |
-| 128 | 32 | 32 | $\sim$128 KB |
+前向 tile 由 `impl::ForwardTilingConfig` 集中定义（scalar 与 WMMA 两套）：
+
+| head_dim | scalar 前向 $B_r \times B_c$ | WMMA 前向 $B_r \times B_c$ |
+|----------|-----------------------------|----------------------------|
+| 32 | 64 × 64 | 64 × 32 |
+| 64 | 64 × 64（sm_75 等回退 32 × 32） | 64 × 32 |
+| 128 | 32 × 32（回退 16 × 16） | 32 × 32 |
+
+反向使用更保守的 `BackwardTilingConfig`（如 hd128 为 16 × 32），因为 shared
+memory 需要容纳更多梯度张量。共享内存按 head_dim 运行时动态分配。
 
 ### 优化技术
 
@@ -271,8 +310,9 @@ $$
 
 | 数据类型 | 前向 | 反向 |
 |----------|------|------|
-| FP32 (`float`) | 完整 | 完整 |
-| FP16 (`half`) | 完整 | 完整 |
+| FP32 (`float`) | 完整（scalar） | 完整（scalar） |
+| FP16 (`half`) | 完整（WMMA / scalar fallback） | 完整（scalar） |
+| BF16 (`__nv_bfloat16`) | 完整（WMMA / scalar fallback） | 完整（scalar） |
 
 ---
 
