@@ -16,7 +16,7 @@
 
 CuFlash-Attn 是一个**从零实现的 FlashAttention 算法**，用于教育学习、研究实验和轻量集成。
 
-在五仓学习路径中，本仓库负责 CUDA C++ FlashAttention 前向/反向的专项深挖；CUDA 基础、Triton 实现、完整推理运行时和 Serving 控制面分别由其他主仓承担。整体顺序见 [`cuda-kernel-academy/LEARNING_PATH.md`](https://github.com/AICL-Lab/cuda-kernel-academy/blob/master/LEARNING_PATH.md)。
+在五仓学习路径中，本仓库负责 CUDA C++ FlashAttention 前向/反向的专项深挖；CUDA 基础、Triton 实现、完整推理运行时和 Serving 控制面分别由其他主仓承担。整体顺序见 [`cuda-foundations/LEARNING_PATH.md`](https://github.com/AICL-Lab/cuda-foundations/blob/master/LEARNING_PATH.md)。
 
 ### 项目状态
 
@@ -74,7 +74,7 @@ CuFlash-Attn 是一个**从零实现的 FlashAttention 算法**，用于教育�
 - 优化叙事与 benchmark（Roofline、kernel 深挖）
 
 **OUT（明确不做，见对应仓库）**：
-- GEMM 基础与 CUDA 编程学习 → [cuda-kernel-academy](https://github.com/AICL-Lab/cuda-kernel-academy)
+- GEMM 基础与 CUDA 编程学习 → [cuda-foundations](https://github.com/AICL-Lab/cuda-foundations)
 - Triton 版算子（参考实现）→ [triton-fused-ops](https://github.com/AICL-Lab/triton-fused-ops)
 - 完整推理运行时（模型加载/采样/生成）→ [tiny-llm](https://github.com/AICL-Lab/tiny-llm)
 
