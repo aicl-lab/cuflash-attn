@@ -1,5 +1,7 @@
 # CuFlash-Attn
 
+> 📚 Portfolio map: https://github.com/aicl-lab/aicl-lab
+
 > **从零实现的 CUDA C++ FlashAttention 教学/参考实现；FP16/BF16 前向已接入 WMMA。**
 
 [![CI](https://img.shields.io/github/actions/workflow/status/AICL-Lab/cuflash-attn/ci.yml?branch=master&style=flat-square&logo=github&label=CI)](https://github.com/AICL-Lab/cuflash-attn/actions/workflows/ci.yml)
