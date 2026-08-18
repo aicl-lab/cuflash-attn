@@ -651,4 +651,67 @@ BENCHMARK(BM_Forward_Causal)
     ->Unit(benchmark::kMillisecond)
     ->UseManualTime();
 
+// =============================================================================
+// FlashDecoding (Split-KV) decode benchmark: single query per (batch, head)
+// against a long KV cache, split into num_chunks blocks.
+// =============================================================================
+static void BM_Decode_FP16(benchmark::State& state) {
+    int seq_len = state.range(0);
+    int head_dim = state.range(1);
+    int batch_size = 1;
+    int num_heads = 8;
+    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    // 每 chunk 约 128 个 KV 位置；长序列时展示 Split-KV 并行收益。
+    int num_chunks = std::max(1, seq_len / 128);
+
+    size_t q_size = static_cast<size_t>(batch_size) * num_heads * head_dim;         // Q [bh, 1, D]
+    size_t kv_size = static_cast<size_t>(batch_size) * num_heads * seq_len * head_dim; // K/V
+    size_t o_size = q_size;
+    size_t l_size = static_cast<size_t>(batch_size) * num_heads;
+
+    auto devs = allocate_and_init<half>({q_size, kv_size, kv_size, o_size});
+    auto l_bufs = allocate_and_init<float>({l_size});
+
+    half *d_Q = devs[0], *d_K = devs[1], *d_V = devs[2], *d_O = devs[3];
+    float* d_L = l_bufs[0];
+
+    cudaStream_t stream = nullptr;
+    cudaStreamCreate(&stream);
+    cudaEvent_t ev_start = nullptr, ev_stop = nullptr;
+    cudaEventCreate(&ev_start);
+    cudaEventCreate(&ev_stop);
+
+    for (auto _ : state) {
+        cudaEventRecord(ev_start, stream);
+        auto err = cuflash::flash_attention_decode(d_Q, d_K, d_V, d_O, d_L, batch_size, num_heads,
+                                                   seq_len, head_dim, scale, num_chunks, stream);
+        cudaEventRecord(ev_stop, stream);
+        if (err != cuflash::FlashAttentionError::SUCCESS) {
+            state.SkipWithError("flash_attention_decode failed");
+            break;
+        }
+        cudaEventSynchronize(ev_stop);
+        float elapsed_ms = 0.0f;
+        cudaEventElapsedTime(&elapsed_ms, ev_start, ev_stop);
+        state.SetIterationTime(elapsed_ms / 1000.0);
+    }
+
+    state.SetLabel("decode: bh=" + std::to_string(batch_size * num_heads) +
+                   " chunks=" + std::to_string(num_chunks));
+
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
+    cudaStreamDestroy(stream);
+    for (auto* ptr : devs) cudaFree(ptr);
+    for (auto* ptr : l_bufs) cudaFree(ptr);
+}
+
+BENCHMARK(BM_Decode_FP16)
+    ->Args({1024, 64})
+    ->Args({4096, 64})
+    ->Args({16384, 64})
+    ->Args({65536, 64})
+    ->Unit(benchmark::kMillisecond)
+    ->UseManualTime();
+
 BENCHMARK_MAIN();

@@ -70,6 +70,34 @@ CUFLASH_EXPORT FlashAttentionError flash_attention_backward(
     __nv_bfloat16* dV, int batch_size, int num_heads, int seq_len, int head_dim, float scale,
     bool causal, cudaStream_t stream = 0);
 
+// Decode pass (FlashDecoding / Split-KV) — query_len == 1 against a long KV.
+// Q: [batch_size * num_heads, 1, head_dim]
+// K/V: [batch_size * num_heads, seq_len, head_dim]
+// O: [batch_size * num_heads, 1, head_dim]
+// L: [batch_size * num_heads]  (logsumexp, for downstream use/backward)
+// num_chunks: 沿 KV 序列维拆分的块数（>0）；会被 clamp 到合法上限。
+//   每块独立计算局部 online softmax，再跨块归约（Split-KV/FlashDecoding）。
+// 语义：单 query 对全部 KV 行做 attention（decode 阶段 causal 的
+// query 位于 seq_len-1，注意力集合即 [0, seq_len)）。
+CUFLASH_EXPORT FlashAttentionError flash_attention_decode(const float* Q, const float* K,
+                                                          const float* V, float* O, float* L,
+                                                          int batch_size, int num_heads,
+                                                          int seq_len, int head_dim, float scale,
+                                                          int num_chunks, cudaStream_t stream = 0);
+
+CUFLASH_EXPORT FlashAttentionError flash_attention_decode(const half* Q, const half* K,
+                                                          const half* V, half* O, float* L,
+                                                          int batch_size, int num_heads,
+                                                          int seq_len, int head_dim, float scale,
+                                                          int num_chunks, cudaStream_t stream = 0);
+
+CUFLASH_EXPORT FlashAttentionError flash_attention_decode(const __nv_bfloat16* Q,
+                                                          const __nv_bfloat16* K,
+                                                          const __nv_bfloat16* V, __nv_bfloat16* O,
+                                                          float* L, int batch_size, int num_heads,
+                                                          int seq_len, int head_dim, float scale,
+                                                          int num_chunks, cudaStream_t stream = 0);
+
 }  // namespace cuflash
 
 #ifdef __cplusplus

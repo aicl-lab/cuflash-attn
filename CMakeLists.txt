@@ -37,6 +37,7 @@ set(SOURCES
     src/api/flash_attention_api.cu
     src/forward/flash_attention_forward_typed.cu
     src/forward/flash_attention_forward_wmma.cu
+    src/forward/flash_decoding.cu
     src/backward/flash_attention_backward_typed.cu
     src/kernels/tile_io.cu
     src/kernels/matmul.cu
@@ -141,6 +142,7 @@ if(BUILD_TESTS)
         tests/test_main.cpp
         tests/unit/test_online_softmax.cu
         tests/unit/test_forward.cu
+        tests/unit/test_flash_decoding.cu
         tests/unit/test_backward.cu
         tests/unit/test_causal_mask.cu
         tests/unit/test_error_handling.cu
