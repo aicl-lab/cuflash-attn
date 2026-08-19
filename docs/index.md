@@ -15,7 +15,7 @@ hero:
       link: /guide/quick-start
     - theme: alt
       text: 查看源码
-      link: https://github.com/AICL-Lab/cuflash-attn
+      link: https://github.com/aicl-lab/cuflash-attn
 ---
 
 <script setup>
@@ -456,7 +456,7 @@ const features = [
 ::: code-group
 
 ```bash [克隆 & 构建]
-git clone https://github.com/AICL-Lab/cuflash-attn.git
+git clone https://github.com/aicl-lab/cuflash-attn.git
 cd cuflash-attn
 
 cmake --preset release

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- 面向用户的 GitHub 链接统一为 `github.com/aicl-lab/...`
+
 ---
 
 ## [0.5.0] - 2026-08-05
@@ -304,16 +307,16 @@ This release introduces complete FP16 backward pass support and a thoroughly res
 
 ## Release Links | 发布链接
 
-- [v0.2.0](https://github.com/AICL-Lab/cuflash-attn/releases/tag/v0.2.0)
-- [v0.1.0](https://github.com/AICL-Lab/cuflash-attn/releases/tag/v0.1.0)
-- [v0.1.0-alpha.2](https://github.com/AICL-Lab/cuflash-attn/releases/tag/v0.1.0-alpha.2)
-- [v0.1.0-alpha.1](https://github.com/AICL-Lab/cuflash-attn/releases/tag/v0.1.0-alpha.1)
+- [v0.2.0](https://github.com/aicl-lab/cuflash-attn/releases/tag/v0.2.0)
+- [v0.1.0](https://github.com/aicl-lab/cuflash-attn/releases/tag/v0.1.0)
+- [v0.1.0-alpha.2](https://github.com/aicl-lab/cuflash-attn/releases/tag/v0.1.0-alpha.2)
+- [v0.1.0-alpha.1](https://github.com/aicl-lab/cuflash-attn/releases/tag/v0.1.0-alpha.1)
 
 ---
 
-[Unreleased]: https://github.com/AICL-Lab/cuflash-attn/compare/v0.5.0...HEAD
-[0.5.0]: https://github.com/AICL-Lab/cuflash-attn/compare/v0.4.0...v0.5.0
-[0.2.0]: https://github.com/AICL-Lab/cuflash-attn/releases/tag/v0.2.0
-[0.1.0]: https://github.com/AICL-Lab/cuflash-attn/releases/tag/v0.1.0
-[0.1.0-alpha.2]: https://github.com/AICL-Lab/cuflash-attn/releases/tag/v0.1.0-alpha.2
-[0.1.0-alpha.1]: https://github.com/AICL-Lab/cuflash-attn/releases/tag/v0.1.0-alpha.1
+[Unreleased]: https://github.com/aicl-lab/cuflash-attn/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/aicl-lab/cuflash-attn/compare/v0.4.0...v0.5.0
+[0.2.0]: https://github.com/aicl-lab/cuflash-attn/releases/tag/v0.2.0
+[0.1.0]: https://github.com/aicl-lab/cuflash-attn/releases/tag/v0.1.0
+[0.1.0-alpha.2]: https://github.com/aicl-lab/cuflash-attn/releases/tag/v0.1.0-alpha.2
+[0.1.0-alpha.1]: https://github.com/aicl-lab/cuflash-attn/releases/tag/v0.1.0-alpha.1

@@ -4,11 +4,11 @@
 
 > **从零实现的 CUDA C++ FlashAttention 教学/参考实现；FP16/BF16 前向已接入 WMMA。**
 
-[![CI](https://img.shields.io/github/actions/workflow/status/AICL-Lab/cuflash-attn/ci.yml?branch=master&style=flat-square&logo=github&label=CI)](https://github.com/AICL-Lab/cuflash-attn/actions/workflows/ci.yml)
-[![CodeQL](https://img.shields.io/github/actions/workflow/status/AICL-Lab/cuflash-attn/codeql.yml?branch=master&style=flat-square&logo=github&label=CodeQL)](https://github.com/AICL-Lab/cuflash-attn/actions/workflows/codeql.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/AICL-Lab/cuflash-attn/ci.yml?branch=master&style=flat-square&logo=github&label=CI)](https://github.com/aicl-lab/cuflash-attn/actions/workflows/ci.yml)
+[![CodeQL](https://img.shields.io/github/actions/workflow/status/AICL-Lab/cuflash-attn/codeql.yml?branch=master&style=flat-square&logo=github&label=CodeQL)](https://github.com/aicl-lab/cuflash-attn/actions/workflows/codeql.yml)
 [![Docs](https://img.shields.io/github/actions/workflow/status/AICL-Lab/cuflash-attn/pages.yml?branch=master&style=flat-square&logo=githubpages&logoColor=white&label=文档)](https://aicl-lab.github.io/cuflash-attn/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/github/v/release/AICL-Lab/cuflash-attn?style=flat-square&label=版本)](https://github.com/AICL-Lab/cuflash-attn/releases)
+[![Version](https://img.shields.io/github/v/release/AICL-Lab/cuflash-attn?style=flat-square&label=版本)](https://github.com/aicl-lab/cuflash-attn/releases)
 
 [文档](https://aicl-lab.github.io/cuflash-attn/) · [API 参考](https://aicl-lab.github.io/cuflash-attn/api-reference) · [更新日志](CHANGELOG.md)
 
@@ -18,7 +18,7 @@
 
 CuFlash-Attn 是一个**从零实现的 FlashAttention 算法**，用于教育学习、研究实验和轻量集成。
 
-在五仓学习路径中，本仓库负责 CUDA C++ FlashAttention 前向/反向的专项深挖；CUDA 基础、Triton 实现、完整推理运行时和 Serving 控制面分别由其他主仓承担。整体顺序见 [`cuda-foundations/LEARNING_PATH.md`](https://github.com/AICL-Lab/cuda-foundations/blob/master/LEARNING_PATH.md)。
+在五仓学习路径中，本仓库负责 CUDA C++ FlashAttention 前向/反向的专项深挖；CUDA 基础、Triton 实现、完整推理运行时和 Serving 控制面分别由其他主仓承担。整体顺序见 [`cuda-foundations/LEARNING_PATH.md`](https://github.com/aicl-lab/cuda-foundations/blob/master/LEARNING_PATH.md)。
 
 ### 项目状态
 
@@ -76,9 +76,9 @@ CuFlash-Attn 是一个**从零实现的 FlashAttention 算法**，用于教育�
 - 优化叙事与 benchmark（Roofline、kernel 深挖）
 
 **OUT（明确不做，见对应仓库）**：
-- GEMM 基础与 CUDA 编程学习 → [cuda-foundations](https://github.com/AICL-Lab/cuda-foundations)
-- Triton 版算子（参考实现）→ [triton-fused-ops](https://github.com/AICL-Lab/triton-fused-ops)
-- 完整推理运行时（模型加载/采样/生成）→ [tiny-llm](https://github.com/AICL-Lab/tiny-llm)
+- GEMM 基础与 CUDA 编程学习 → [cuda-foundations](https://github.com/aicl-lab/cuda-foundations)
+- Triton 版算子（参考实现）→ [triton-fused-ops](https://github.com/aicl-lab/triton-fused-ops)
+- 完整推理运行时（模型加载/采样/生成）→ [tiny-llm](https://github.com/aicl-lab/tiny-llm)
 
 ## 🚀 快速开始
 
@@ -93,7 +93,7 @@ CuFlash-Attn 是一个**从零实现的 FlashAttention 算法**，用于教育�
 
 ```bash
 # 克隆仓库
-git clone https://github.com/AICL-Lab/cuflash-attn.git
+git clone https://github.com/aicl-lab/cuflash-attn.git
 cd cuflash-attn
 
 # 使用预设构建（Release 模式）
