@@ -26,7 +26,7 @@ concurrency:
 jobs:
   deploy:
     # Only run on the original repository, not on forks
-    if: github.repository == 'AICL-Lab/cuflash-attn'
+    if: github.repository == 'open-infra-ai/cuflash-attn'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

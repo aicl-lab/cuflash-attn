@@ -33,8 +33,8 @@ const nav = [
     text: '项目',
     items: [
       { text: '项目状态', link: '/project-status' },
-      { text: '发布版本', link: 'https://github.com/aicl-lab/cuflash-attn/releases' },
-      { text: '仓库源码', link: 'https://github.com/aicl-lab/cuflash-attn' }
+      { text: '发布版本', link: 'https://github.com/open-infra-ai/cuflash-attn/releases' },
+      { text: '仓库源码', link: 'https://github.com/open-infra-ai/cuflash-attn' }
     ]
   }
 ]
@@ -113,14 +113,14 @@ export default withMermaid(defineConfig({
     outline: { label: '本页目录', level: 'deep' },
     docFooter: { prev: '上一页', next: '下一页' },
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/aicl-lab/cuflash-attn' }
+      { icon: 'github', link: 'https://github.com/open-infra-ai/cuflash-attn' }
     ],
     footer: {
       message: '稳定 v0.5.0 基线 · 精简 CUDA FlashAttention 参考实现',
-      copyright: 'Copyright 2026 AICL-Lab.'
+      copyright: 'Copyright 2026 open-infra-ai.'
     },
     editLink: {
-      pattern: 'https://github.com/aicl-lab/cuflash-attn/edit/master/docs/:path',
+      pattern: 'https://github.com/open-infra-ai/cuflash-attn/edit/master/docs/:path',
       text: '在 GitHub 上编辑此页面'
     },
     lastUpdated: {

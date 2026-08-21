@@ -47,7 +47,7 @@ g++ --version
 
 ```bash
 # 克隆仓库
-git clone https://github.com/aicl-lab/cuflash-attn.git
+git clone https://github.com/open-infra-ai/cuflash-attn.git
 cd cuflash-attn
 
 # 使用 preset 构建（推荐）

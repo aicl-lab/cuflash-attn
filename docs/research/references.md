@@ -373,9 +373,9 @@
 ```bibtex
 @software{cuflashattn2024,
   title={CuFlash-Attn: From-Scratch {CUDA} {C++} {FlashAttention} Reference Library},
-  author={{AICL-Lab}},
+  author={{open-infra-ai}},
   year={2024},
-  url={https://github.com/aicl-lab/cuflash-attn},
+  url={https://github.com/open-infra-ai/cuflash-attn},
   note={Version 0.5.0, stable baseline}
 }
 ```

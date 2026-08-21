@@ -421,4 +421,4 @@ switch (err) {
 - [API 参考](api-reference.md)
 - [构建指南](building.md)
 - [算法文档](algorithm.md)
-- [GitHub Issues](https://github.com/aicl-lab/cuflash-attn/issues)
+- [GitHub Issues](https://github.com/open-infra-ai/cuflash-attn/issues)

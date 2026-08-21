@@ -14,7 +14,7 @@
 ### 克隆仓库
 
 ```bash
-git clone https://github.com/aicl-lab/cuflash-attn.git
+git clone https://github.com/open-infra-ai/cuflash-attn.git
 cd cuflash-attn
 ```
 
